@@ -29,19 +29,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set image tags
+      - name: Set image tags (lowercase)
         id: vars
         run: |
-          # default tag
-          IMAGE_NAME=ghcr.io/${{ github.repository }}
+          OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          REPO=$(basename "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="ghcr.io/${OWNER}/${REPO}"
           DEFAULT_TAG="${IMAGE_NAME}:latest"
-          
+
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             VERSION_TAG="${IMAGE_NAME}:${GITHUB_REF_NAME/v/}"
           else
             VERSION_TAG=""
           fi
-          
+
           echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
           echo "default_tag=${DEFAULT_TAG}" >> $GITHUB_OUTPUT
           echo "version_tag=${VERSION_TAG}" >> $GITHUB_OUTPUT
