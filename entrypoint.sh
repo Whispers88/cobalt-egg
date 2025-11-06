@@ -17,17 +17,18 @@ have_carbon() { [[ -d "/home/container/carbon" ]]; }
 
 uninstall_oxide() {
   if have_oxide; then
-    log "Removing Oxide files…"
+    log "Removing Oxide (requires validation to fully clean)…"
     rm -rf /home/container/oxide
-    rm -f /home/container/RustDedicated_Data/Managed/{uMod.*,Oxide.*,Carbon.*}.dll || true
   fi
 }
 
 uninstall_carbon() {
   if have_carbon; then
     log "Removing Carbon files…"
+    rm -f /home/container/Carbon.targets
+    rm -rf /home/container/doorstop_config
+    rm -f /home/container/winhttp.dll
     rm -rf /home/container/carbon
-    rm -f /home/container/RustDedicated_Data/Managed/{Carbon.*,uMod.*,Oxide.*}.dll || true
   fi
 }
 
@@ -45,11 +46,11 @@ install_oxide() {
 install_carbon() {
   local channel="production" minimal="0"
   case "${FRAMEWORK}" in
-    carbon-edge* )    channel="edge" ;;
-    carbon-staging* ) channel="staging" ;;
-    carbon-aux1* )    channel="aux1" ;;
-    carbon-aux2* )    channel="aux2" ;;
-    carbon* )         channel="production" ;;
+    carbon-edge* )    channel="edge" ;; 
+    carbon-staging* ) channel="staging" ;; 
+    carbon-aux1* )    channel="aux1" ;; 
+    carbon-aux2* )    channel="aux2" ;; 
+    carbon* )         channel="production" ;; 
   esac
   [[ "${FRAMEWORK}" == *"-minimal" ]] && minimal="1"
 
@@ -58,20 +59,20 @@ install_carbon() {
   pushd "$tmpdir" >/dev/null
 
   if [[ "$minimal" == "1" ]]; then
-    case "$channel" in
-      production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.Minimal.tar.gz" ;;
-      edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.Minimal.tar.gz" ;;
-      staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.Minimal.tar.gz" ;;
-      aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1.Minimal.tar.gz" ;;
-      aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.Minimal.tar.gz" ;;
+    case "${channel}" in
+      production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.Minimal.tar.gz" ;; 
+      edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.Minimal.tar.gz" ;; 
+      staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.Minimal.tar.gz" ;; 
+      aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1.Minimal.tar.gz" ;; 
+      aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.Minimal.tar.gz" ;; 
     esac
   else
-    case "$channel" in
-      production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.tar.gz" ;;
-      edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.tar.gz" ;;
-      staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.tar.gz" ;;
-      aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1.tar.gz" ;;
-      aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.tar.gz" ;;
+    case "${channel}" in
+      production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.tar.gz" ;; 
+      edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.tar.gz" ;; 
+      staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.tar.gz" ;; 
+      aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1.tar.gz" ;; 
+      aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.tar.gz" ;; 
     esac
   fi
 
