@@ -1,6 +1,6 @@
 # Universal Rust server image for Pterodactyl (Vanilla / Oxide / Carbon)
 # Pin a stable base to avoid surprise breakage
-FROM cm2network/steamcmd:debian
+FROM cm2network/steamcmd:latest
 
 LABEL org.opencontainers.image.title="rust-universal"
 LABEL org.opencontainers.image.description="Universal Rust Dedicated Server image for Pterodactyl: Vanilla, Oxide/uMod, Carbon (production/edge/staging/minimal)."
