@@ -1,0 +1,70 @@
+name: Publish Docker image to GHCR
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image tags
+        id: vars
+        run: |
+          # default tag
+          IMAGE_NAME=ghcr.io/${{ github.repository }}
+          DEFAULT_TAG="${IMAGE_NAME}:latest"
+          
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION_TAG="${IMAGE_NAME}:${GITHUB_REF_NAME/v/}"
+          else
+            VERSION_TAG=""
+          fi
+          
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "default_tag=${DEFAULT_TAG}" >> $GITHUB_OUTPUT
+          echo "version_tag=${VERSION_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build and push 'latest' image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.default_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push version tag (if applicable)
+        if: steps.vars.outputs.version_tag != ''
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.version_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
