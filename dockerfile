@@ -24,6 +24,9 @@ RUN arch="$(dpkg --print-architecture)"; \
 # --- Stage 2: final runtime on top of cm2network/steamcmd (no apt here) ---
 FROM cm2network/steamcmd:latest
 
+# Ensure we are root in this stage (cm2network images may set a non-root default user)
+USER root
+
 LABEL org.opencontainers.image.title="rust-universal"
 LABEL org.opencontainers.image.description="Universal Rust Dedicated Server image for Pterodactyl: Vanilla, Oxide/uMod, Carbon."
 LABEL maintainer="you@example.com"
@@ -36,9 +39,23 @@ COPY --from=fetch /opt/node /opt/node
 ENV PATH="/opt/node/bin:${PATH}"
 
 # Pterodactyl-compatible user & dirs
-RUN useradd -m -d /home/container -s /bin/bash container \
- && mkdir -p /home/container/steamcmd /home/container/.steam/sdk32 /home/container/.steam/sdk64 /home/container/bin \
- && chown -R container:container /home/container
+# - Use /bin/sh (always present); use /bin/bash when available
+# - Use useradd when available (Debian/Ubuntu/RHEL), else fall back to adduser (BusyBox/Alpine)
+RUN set -eux; \
+  sh_path="/bin/sh"; \
+  if [ -x /bin/bash ]; then sh_path="/bin/bash"; fi; \
+  if command -v useradd >/dev/null 2>&1; then \
+    if ! id -u container >/dev/null 2>&1; then \
+      useradd -m -U -d /home/container -s "$sh_path" container; \
+    fi; \
+  else \
+    # BusyBox/Alpine-style adduser
+    if ! id -u container >/dev/null 2>&1; then \
+      adduser -D -h /home/container -s "$sh_path" container || true; \
+    fi; \
+  fi; \
+  mkdir -p /home/container/steamcmd /home/container/.steam/sdk32 /home/container/.steam/sdk64 /home/container/bin; \
+  chown -R container:container /home/container
 
 WORKDIR /home/container
 
@@ -58,6 +75,7 @@ RUN chmod +x /entrypoint.sh /home/container/wrapper.js \
 # Wrapper dependency (local install)
 RUN npm install --prefix /home/container --omit=dev ws@8
 
+# Drop privileges for runtime
 USER container
 
 # Use tini for clean signals; entrypoint does framework logic then calls wrapper
