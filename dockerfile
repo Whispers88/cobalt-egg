@@ -31,7 +31,9 @@ LABEL maintainer="you@example.com"
 # Copy tools fetched in stage 1
 COPY --from=fetch /tini /tini
 COPY --from=fetch /opt/node /opt/node
-RUN ln -s /opt/node/bin/node /usr/local/bin/node && ln -s /opt/node/bin/npm /usr/local/bin/npm
+
+# Put Node on PATH (avoid fragile symlinks)
+ENV PATH="/opt/node/bin:${PATH}"
 
 # Pterodactyl-compatible user & dirs
 RUN useradd -m -d /home/container -s /bin/bash container \
@@ -56,4 +58,7 @@ RUN chmod +x /entrypoint.sh /home/container/wrapper.js \
 # Wrapper dependency (local install)
 RUN npm install --prefix /home/container --omit=dev ws@8
 
-USER containe
+USER container
+
+# Use tini for clean signals; entrypoint does framework logic then calls wrapper
+ENTRYPOINT ["/tini","--","/entrypoint.sh"]
