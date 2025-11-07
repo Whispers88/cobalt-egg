@@ -156,6 +156,7 @@ ARGV=()
 
 # 1) File
 if [[ -n "${RUST_ARGS_FILE:-}" && -f "${RUST_ARGS_FILE}" ]]; then
+  # Read NUL-separated; if file is newline-separated, convert to NUL first
   mapfile -d '' -t ARGV < <(tr '\n' '\0' < "${RUST_ARGS_FILE}") || true
 fi
 
@@ -195,7 +196,6 @@ if [[ "${#ARGV[@]}" -eq 0 ]]; then
   fi
 
   # ---- REPAIR PASS: rejoin values for flags that commonly include spaces ----
-  # Add/adjust flags here as needed.
   REJOIN_FLAGS=(
     "-server.hostname"
     "-server.description"
@@ -205,10 +205,12 @@ if [[ "${#ARGV[@]}" -eq 0 ]]; then
     "-logfile"
   )
   is_flag() { [[ "$1" == -* ]]; }
+  looks_like_flag() { [[ "$1" =~ ^-[-A-Za-z0-9_.]+$ ]]; }
   needs_rejoin() {
     local f="$1"
     for x in "${REJOIN_FLAGS[@]}"; do [[ "$f" == "$x" ]] && return 0; done
-    return 0  # default: be generous and allow joining until next flag after 1+ words
+    # Be generous: allow joining until next flag once we've taken one value
+    return 0
   }
 
   repaired=()
@@ -219,12 +221,9 @@ if [[ "${#ARGV[@]}" -eq 0 ]]; then
       repaired+=("$tok")
       ((i++))
       if [[ $i -lt ${#ARGV[@]} ]]; then
-        # Always take at least one value if present
-        val="${ARGV[$i]}"
-        ((i++))
+        val="${ARGV[$i]}"; ((i++))
         if needs_rejoin "$tok"; then
-          # Slurp additional words until the next looks like a flag
-          while [[ $i -lt ${#ARGV[@]} && ! "${ARGV[$i]}" =~ ^-[-A-Za-z0-9_.]+$ ]]; do
+          while [[ $i -lt ${#ARGV[@]} && ! $(looks_like_flag "${ARGV[$i]}" && echo true) ]]; do
             val+=" ${ARGV[$i]}"
             ((i++))
           done
@@ -261,10 +260,36 @@ if [[ ! -f "$WRAPPER" ]]; then
   err "wrapper.js not found at /wrapper.js or /opt/cobalt/wrapper.js"
   exit 14
 fi
+chmod +x "$WRAPPER" || true
 
-# Write ARGV to a NUL-separated file and exec wrapper with it
+# Write ARGV to a NUL-separated file (no splitting)
 ARGS_FILE="$(mktemp -p /home/container args.XXXXXXXX.nul)"
 # shellcheck disable=SC2059
 printf '%s\0' "${ARGV[@]}" > "${ARGS_FILE}"
 
-exec /opt/node/bin/node "$WRAPPER" --argv-file "${ARGS_FILE}"
+# Find NodeJS
+NODE_BIN="${NODE_BIN:-}"
+if [[ -z "${NODE_BIN}" ]]; then
+  if command -v node >/dev/null 2>&1; then
+    NODE_BIN="$(command -v node)"
+  elif [[ -x /opt/node/bin/node ]]; then
+    NODE_BIN="/opt/node/bin/node"
+  else
+    err "NodeJS not found. Set NODE_BIN to your node path, or ensure 'node' is on PATH."
+    err "Tried: \$(command -v node), /opt/node/bin/node"
+    exit 15
+  fi
+fi
+
+log "Using node: ${NODE_BIN}"
+log "Wrapper: ${WRAPPER}"
+log "Args file: ${ARGS_FILE} ($(wc -c < "${ARGS_FILE}") bytes)"
+
+# Optional debug: show first few argv tokens for sanity
+{
+  printf "[entrypoint] argv[0..7]:"
+  tr '\0' '\n' < "${ARGS_FILE}" | head -n 8 | sed 's/^/ /'
+} || true
+
+# Exec wrapper (no shell re-parsing)
+exec "${NODE_BIN}" "${WRAPPER}" --argv-file "${ARGS_FILE}"
