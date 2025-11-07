@@ -4,6 +4,13 @@
 
 set -euo pipefail
 
+if [ -d /mnt/server ]; then
+  if [ ! -L /home/container ]; then
+    rm -rf /home/container 2>/dev/null || true
+    ln -s /mnt/server /home/container
+  fi
+fi
+
 SRCDS_APPID="258550"
 
 log() { echo "[install] $*"; }
