@@ -35,7 +35,12 @@ if (gameArgs.length === 0) {
 const executable = gameArgs[0];
 const params = gameArgs.slice(1);
 
-console.log(`[wrapper] Executing: ${executable} ${params.map(a => (/[^A-Za-z0-9_/.:-]/.test(a) ? `"${a}"` : a)).join(" ")}`);
+// Safe double-quoting with proper escaping
+const q = s => JSON.stringify(String(s));
+
+console.log(
+  `[wrapper] Executing: ${q(executable)} ${params.map(q).join(" ")}`
+);
 
 // Detect -logfile path (next token is the path)
 let unityLogfile = null;
