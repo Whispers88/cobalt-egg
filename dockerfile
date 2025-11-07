@@ -8,11 +8,11 @@ RUN set -eux; \
     ca-certificates curl xz-utils tar; \
   rm -rf /var/lib/apt/lists/*
 
-# tini (init system)
+# tini (init)
 RUN curl -fsSL -o /tini https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64 \
  && chmod +x /tini
 
-# Official NodeJS binary download
+# official NodeJS binaries
 RUN arch="$(dpkg --print-architecture)"; \
   case "$arch" in \
     amd64) node_arch="x64" ;; \
@@ -24,64 +24,60 @@ RUN arch="$(dpkg --print-architecture)"; \
   rm -f /tmp/node.tar.xz
 
 
-# --- Stage 2: Runtime image using cm2network steamcmd base ---
+# --- Stage 2: runtime using cm2network/steamcmd base ---
 FROM cm2network/steamcmd:latest
 
 USER root
 
-LABEL org.opencontainers.image.title="rust-universal"
-LABEL org.opencontainers.image.description="Universal Rust Dedicated Server image for Pterodactyl: Vanilla, Oxide/uMod, Carbon."
+LABEL org.opencontainers.image.title="rust-universal-nosymlink"
+LABEL org.opencontainers.image.description="Rust Dedicated Server image for Pterodactyl using /mnt/server directly (no symlink)."
 LABEL maintainer="you@example.com"
 
-# Copy node + tini from builder
+# copy tools
 COPY --from=fetch /tini /tini
 COPY --from=fetch /opt/node /opt/node
 
-# Ensure Node is available
+# ensure Node is available
 ENV PATH="/opt/node/bin:${PATH}"
 
-# Tools needed by entrypoint.sh (unzip is important!)
+# runtime deps needed by entrypoint (unzip important for uMod/Carbon)
 RUN set -eux; \
   apt-get update; \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends unzip ca-certificates curl; \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends unzip ca-certificates curl tzdata iproute2; \
   rm -rf /var/lib/apt/lists/*
 
-# Create pterodactyl-compatible user
+# create run user whose home is /mnt/server (matches Wings mount)
 RUN set -eux; \
-  sh_path="/bin/sh"; \
-  if [ -x /bin/bash ]; then sh_path="/bin/bash"; fi; \
   if command -v useradd >/dev/null 2>&1; then \
-    if ! id -u container >/dev/null 2>&1; then \
-      useradd -m -U -d /home/container -s "$sh_path" container; \
-    fi; \
+    useradd -d /mnt/server -m -U -s /bin/bash container || true; \
   else \
-    if ! id -u container >/dev/null 2>&1; then \
-      adduser -D -h /home/container -s "$sh_path" container || true; \
-    fi; \
-  fi; \
-  mkdir -p /home/container/steamcmd /home/container/.steam/sdk32 /home/container/.steam/sdk64 /home/container/bin; \
-  chown -R container:container /home/container
+    adduser -D -h /mnt/server -s /bin/sh container || true; \
+  fi
 
-WORKDIR /mnt/server
+# app bits live inside image (not in /mnt/server)
+# we keep wrapper + its node deps under /opt/cobalt so they exist even if /mnt/server is empty
+RUN mkdir -p /opt/cobalt
+COPY wrapper.js /opt/cobalt/wrapper.js
+COPY entrypoint.sh /entrypoint.sh
 
-# Default environment values
-ENV FRAMEWORK=vanilla \
+# install wrapper dependency
+RUN npm install --prefix /opt/cobalt --omit=dev ws@8
+
+# perms
+RUN chmod +x /entrypoint.sh /opt/cobalt/wrapper.js
+
+# Ptero-friendly defaults (match runtime use of /mnt/server)
+ENV HOME=/mnt/server \
+    FRAMEWORK=vanilla \
     FRAMEWORK_UPDATE=1 \
     VALIDATE=1 \
-    TZ=UTC \
-    HOME=/home/container
+    TZ=UTC
 
-# Copy entrypoint + wrapper
-COPY entrypoint.sh /entrypoint.sh
-COPY wrapper.js /home/container/wrapper.js
+# IMPORTANT: run in /mnt/server directly
+WORKDIR /mnt/server
 
-RUN chmod +x /entrypoint.sh /home/container/wrapper.js \
- && chown -R container:container /home/container
-
-# Install only needed wrapper dependency (WebSocket)
-RUN npm install --prefix /home/container --omit=dev ws@8
-
+# drop privileges
 USER container
 
-# Use tini → entrypoint.sh → wrapper.js
+# tini → bash entrypoint
 ENTRYPOINT ["/tini","--","/entrypoint.sh"]
