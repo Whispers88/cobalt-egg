@@ -5,9 +5,7 @@ const WebSocket = require("ws");
 
 const LATEST_LOG = process.env.LATEST_LOG || "latest.log";
 
-try {
-  if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`);
-} catch {}
+try { if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`); } catch {}
 fs.writeFile(LATEST_LOG, "", (err) => { if (err) console.log("Log init error:", err); });
 
 const args = process.argv.slice(2);
@@ -22,100 +20,90 @@ const seenPercentage = {};
 function filter(data) {
   const str = data.toString();
   if (str.startsWith("Loading Prefab Bundle ")) {
-    const percentage = str.substr("Loading Prefab Bundle ".length);
+    const percentage = str.slice("Loading Prefab Bundle ".length);
     if (seenPercentage[percentage]) return;
     seenPercentage[percentage] = true;
   }
   process.stdout.write(str);
 }
 
-let exited = false;
+// Use shell=true so quoted args in STARTUP work properly
+const gameProcess = spawn(startupCmd, { shell: true, stdio: ["pipe", "pipe", "pipe"] });
 
-// Safer than exec (no 1MB buffer limit)
-const parts = startupCmd.split(" ");
-const gameProcess = spawn(parts[0], parts.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
 gameProcess.stdout.on("data", filter);
 gameProcess.stderr.on("data", filter);
+
 gameProcess.on("exit", (code) => {
-  exited = true;
   console.log("Main game process exited with code", code);
   process.exit(code ?? 0);
 });
 
+// Handle stdin → RCON bridge (until connected)
 function initialListener(data) {
   const command = data.toString().trim();
-  if (command === "quit") {
-    gameProcess.kill("SIGTERM");
-  } else {
-    console.log(`Unable to run "${command}" due to RCON not being connected yet.`);
-  }
+  console.log(`Console not ready yet, ignored: "${command}"`);
 }
 process.stdin.resume();
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", initialListener);
 
-process.on("exit", () => {
-  if (exited) return;
-  console.log("Received request to stop the process, stopping the game...");
-  gameProcess.kill("SIGTERM");
+// Handle container stop signals
+["SIGINT", "SIGTERM"].forEach(sig => {
+  process.on(sig, () => {
+    console.log(`Received ${sig}, stopping server...`);
+    gameProcess.kill("SIGTERM");
+  });
 });
 
-// WebRCON bridge with backoff
 let waiting = true;
 let delay = 3000;
 const maxDelay = 15000;
 const jitter = () => Math.floor(Math.random() * 1000);
-const backoff = () => { delay = Math.min(Math.floor(delay * 1.5), maxDelay); return delay + jitter(); };
+const backoff = () => Math.min(delay = Math.floor(delay * 1.5), maxDelay) + jitter();
 
 function createPacket(command) {
   return JSON.stringify({ Identifier: -1, Message: command, Name: "WebRcon" });
 }
 
-function poll() {
-  const serverHostname = process.env.RCON_IP ? process.env.RCON_IP : "127.0.0.1";
-  const serverPort = process.env.RCON_PORT;
-  const serverPassword = process.env.RCON_PASS;
+(function poll() {
+  const host = process.env.RCON_IP || "127.0.0.1";
+  const port = process.env.RCON_PORT;
+  const pass = process.env.RCON_PASS;
 
-  const ws = new WebSocket(`ws://${serverHostname}:${serverPort}/${serverPassword}`);
+  const ws = new WebSocket(`ws://${host}:${port}/${pass}`);
 
   ws.on("open", () => {
-    console.log('Connected to RCON. Generating the map now. Please wait until the server status switches to "Running".');
     waiting = false;
+    console.log("Connected to WebRCON.");
 
-    // Hack to fix broken console output
     ws.send(createPacket("status"));
 
     process.stdin.removeListener("data", initialListener);
-    gameProcess.stdout.removeListener("data", filter);
-    gameProcess.stderr.removeListener("data", filter);
-
-    process.stdin.on("data", (text) => ws.send(createPacket(text)));
+    process.stdin.on("data", (text) => ws.send(createPacket(text.toString().trim())));
   });
 
   ws.on("message", (data) => {
     try {
-      const json = JSON.parse(data);
-      if (json && json.Message) {
-        console.log(json.Message);
-        fs.appendFile(LATEST_LOG, "\n" + json.Message, () => {});
+      const msg = JSON.parse(data);
+      if (msg?.Message) {
+        console.log(msg.Message);
+        fs.appendFile(LATEST_LOG, msg.Message + "\n", () => {});
       }
     } catch (e) {
-      console.log("RCON JSON parse error:", e);
+      console.log("RCON JSON error:", e);
     }
   });
 
   ws.on("error", () => {
     waiting = true;
-    console.log("Waiting for RCON to come up...");
+    console.log("Waiting for RCON…");
     setTimeout(poll, backoff());
   });
 
   ws.on("close", () => {
     if (!waiting) {
-      console.log("Connection to server closed.");
-      exited = true;
+      console.log("Server closed.");
       process.exit(0);
     }
   });
-}
-poll();
+})();
