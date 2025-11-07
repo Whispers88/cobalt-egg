@@ -156,7 +156,7 @@ ARGV=()
 
 # 1) File
 if [[ -n "${RUST_ARGS_FILE:-}" && -f "${RUST_ARGS_FILE}" ]]; then
-  # Read NUL-separated; if file is newline-separated, convert to NUL first
+  # Read NUL-separated; if newline-separated, convert to NUL first
   mapfile -d '' -t ARGV < <(tr '\n' '\0' < "${RUST_ARGS_FILE}") || true
 fi
 
@@ -205,13 +205,6 @@ if [[ "${#ARGV[@]}" -eq 0 ]]; then
     "-logfile"
   )
   is_flag() { [[ "$1" == -* ]]; }
-  looks_like_flag() { [[ "$1" =~ ^-[-A-Za-z0-9_.]+$ ]]; }
-  needs_rejoin() {
-    local f="$1"
-    for x in "${REJOIN_FLAGS[@]}"; do [[ "$f" == "$x" ]] && return 0; done
-    # Be generous: allow joining until next flag once we've taken one value
-    return 0
-  }
 
   repaired=()
   i=0
@@ -222,12 +215,12 @@ if [[ "${#ARGV[@]}" -eq 0 ]]; then
       ((i++))
       if [[ $i -lt ${#ARGV[@]} ]]; then
         val="${ARGV[$i]}"; ((i++))
-        if needs_rejoin "$tok"; then
-          while [[ $i -lt ${#ARGV[@]} && ! $(looks_like_flag "${ARGV[$i]}" && echo true) ]]; do
-            val+=" ${ARGV[$i]}"
-            ((i++))
-          done
-        fi
+        # Slurp additional words until the next token looks like a flag
+        # NOTE: fixed regex check; no command substitution (avoids set -e exits)
+        while [[ $i -lt ${#ARGV[@]} && ! "${ARGV[$i]}" =~ ^-[-A-Za-z0-9_.]+$ ]]; do
+          val+=" ${ARGV[$i]}"
+          ((i++))
+        done
         repaired+=("$val")
       fi
     else
