@@ -152,12 +152,23 @@ esac
 #   - Layout A: panel Start Command passes args (/entrypoint.sh ./RustDedicated …)
 #   - Layout B: panel STARTUP env holds the templated string
 # -----------------------------------------------------------------------
+
+# Helper: re-build a shell command from "$@" where each arg is single-quoted.
+# Handles inner single quotes safely: ' -> '"'"'
+join_args_as_shell_string() {
+  local out="" a esc
+  for a in "$@"; do
+    esc=${a//\'/\'\"\'\"\'}
+    out+="'${esc}' "
+  done
+  printf '%s' "${out% }"
+}
+
 MODIFIED_STARTUP=""
 
 if [[ "$#" -gt 0 ]]; then
-  # Rebuild one string from original args, preserving spaces/quotes
-  MODIFIED_STARTUP="$(printf '%q ' "$@")"
-  MODIFIED_STARTUP="${MODIFIED_STARTUP% }"   # trim trailing space
+  # Rebuild one string from original args, preserving spaces/quotes exactly
+  MODIFIED_STARTUP="$(join_args_as_shell_string "$@")"
 else
   # STARTUP env expansion: convert {{VAR}} → ${VAR} and expand safely
   if [[ -z "${STARTUP:-}" ]]; then
@@ -197,5 +208,7 @@ fi
 
 # -----------------------------------------------------------------------
 # Launch through the console-wrapper (which mirrors logfile to panel)
+# The wrapper runs the string under bash (`shell: /bin/bash`), so the
+# single-quoted args here become the original argv without splitting.
 # -----------------------------------------------------------------------
 exec /opt/node/bin/node "${WRAPPER}" "${MODIFIED_STARTUP}"
