@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
 // ============================================================================
-// Rust wrapper -- Console-first (NO RCON), with logfile mirroring
-// - Runs the full startup string under /bin/bash (no splitting)
-// - Mirrors stdout/stderr to panel console
-// - Writes raw logs to latest.log
-// - If -logfile is present, tails it and mirrors to the panel too
+// Rust wrapper -- Console-first (NO RCON), argv-safe + logfile mirroring
+// - Receives argv for RustDedicated via --argv <args...>
+// - Spawns RustDedicated WITHOUT a shell (preserves multi-word args)
+// - Mirrors stdout/stderr to panel, writes raw to latest.log
+// - If -logfile is present, tails it and mirrors to panel too
 // ============================================================================
 
 const { spawn } = require("child_process");
@@ -17,39 +17,47 @@ const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
 try { if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`); } catch {}
 fs.writeFileSync(LATEST_LOG, "", { flag: "w" });
 
-// Require startup command
-const args = process.argv.slice(2);
-if (!args.length) {
-  console.error("[wrapper] ERROR: No startup command provided.");
+const argv = process.argv.slice(2);
+
+// Expect "--argv" followed by the full RustDedicated argv
+const flagIndex = argv.indexOf("--argv");
+if (flagIndex === -1) {
+  console.error("[wrapper] ERROR: Missing --argv marker.");
   process.exit(1);
 }
-const startupCmd = args.join(" ");
-console.log(`[wrapper] Starting Rust: ${startupCmd}`);
 
-// Detect -logfile (quoted or unquoted)
-function extractLogfile(cmd) {
-  const m = cmd.match(/-logfile\s+("([^"]+)"|(\S+))/);
-  if (!m) return null;
-  return m[2] || m[3] || null;
+const gameArgs = argv.slice(flagIndex + 1);
+if (gameArgs.length === 0) {
+  console.error("[wrapper] ERROR: No arguments provided for RustDedicated.");
+  process.exit(1);
 }
-const unityLogfile = extractLogfile(startupCmd);
 
-// Prefer bash for [[ ]], ==, $(), etc.
-const preferredShell = fs.existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
+const executable = gameArgs[0];
+const params = gameArgs.slice(1);
 
-// Spawn the game under a shell so we keep the exact command string
-const game = spawn(startupCmd, {
-  shell: preferredShell,
+console.log(`[wrapper] Executing: ${executable} ${params.map(a => (/[^A-Za-z0-9_/.:-]/.test(a) ? `"${a}"` : a)).join(" ")}`);
+
+// Detect -logfile path (next token is the path)
+let unityLogfile = null;
+for (let i = 0; i < params.length; i++) {
+  if (params[i] === "-logfile" && i + 1 < params.length) {
+    unityLogfile = params[i + 1];
+    break;
+  }
+}
+
+// Spawn WITHOUT shell: exact argv preserved
+const game = spawn(executable, params, {
   stdio: ["pipe", "pipe", "pipe"],
   cwd: "/home/container",
 });
 
-// Mirror game stdout/stderr to panel + wrapper log (raw)
-function mirror(data, isErr = false) {
-  const s = data.toString();
+function mirror(chunk, isErr = false) {
+  const s = chunk.toString();
   (isErr ? process.stderr : process.stdout).write(s);
   fs.appendFile(LATEST_LOG, s.replace(/\r/g, ""), () => {});
 }
+
 game.stdout.on("data", (d) => mirror(d, false));
 game.stderr.on("data", (d) => mirror(d, true));
 

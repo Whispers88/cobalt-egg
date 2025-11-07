@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # =======================================================================
-# Rust Dedicated Server entrypoint for Pterodactyl (console-first)
+# Rust Dedicated Server entrypoint for Pterodactyl (console-first, argv-safe)
 # - Works from /home/container
-# - Quote-safe handling of Start Command args (preserves spaces)
+# - Preserves multi-word values by passing argv array, not a string
 # - Supports Vanilla / Oxide / Carbon
 # - Validates via SteamCMD (optional)
 # - Launches via wrapper.js which mirrors logfile to panel
@@ -19,8 +19,6 @@ err() { echo -e "[entrypoint][error] $*" >&2; }
 # niceties
 ulimit -n 65535 || true
 umask 002
-
-# best-effort ownership fix (harmless if not needed)
 chown -R "$(id -u):$(id -g)" /home/container 2>/dev/null || true
 
 # -----------------------------------------------------------------------
@@ -147,56 +145,46 @@ case "${FRAMEWORK}" in
 esac
 
 # -----------------------------------------------------------------------
-# Build final startup command (QUOTE-SAFE)
+# Build argv to pass to wrapper (NO STRING JOINING)
 # Supports:
 #   - Layout A: panel Start Command passes args (/entrypoint.sh ./RustDedicated …)
 #   - Layout B: panel STARTUP env holds the templated string
 # -----------------------------------------------------------------------
 
-# Helper: re-build a shell command from "$@" where each arg is single-quoted.
-# Handles inner single quotes safely: ' -> '"'"'
-join_args_as_shell_string() {
-  local out="" a esc
-  for a in "$@"; do
-    esc=${a//\'/\'\"\'\"\'}
-    out+="'${esc}' "
-  done
-  printf '%s' "${out% }"
-}
-
-MODIFIED_STARTUP=""
-
+# If args were passed after /entrypoint.sh, use them as-is.
 if [[ "$#" -gt 0 ]]; then
-  # Rebuild one string from original args, preserving spaces/quotes exactly
-  MODIFIED_STARTUP="$(join_args_as_shell_string "$@")"
+  ARGV=( "$@" )
 else
-  # STARTUP env expansion: convert {{VAR}} → ${VAR} and expand safely
+  # STARTUP env expansion: convert {{VAR}} → ${VAR}, expand, then parse into argv
   if [[ -z "${STARTUP:-}" ]]; then
     err "No startup provided: neither Start Command args nor STARTUP env found."
     exit 12
   fi
-  MODIFIED_STARTUP="$(
+  # Expand panel variables while preserving quotes
+  EXPANDED="$(
     eval "echo \"$(printf '%s' "${STARTUP}" | sed -e 's/{{/${/g' -e 's/}}/}/g')\""
   )"
+  # Parse EXPANDED into $1..$N (argv) using the shell's own parser
+  eval "set -- ${EXPANDED}"
+  ARGV=( "$@" )
 fi
 
-# Strip accidental recursion if someone included /entrypoint.sh in STARTUP
-if [[ "${MODIFIED_STARTUP}" == /entrypoint.sh* ]]; then
-  log "Note: stripping leading '/entrypoint.sh' from startup string"
-  MODIFIED_STARTUP="${MODIFIED_STARTUP#/entrypoint.sh }"
+# If someone accidentally included /entrypoint.sh, strip it.
+if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then
+  ARGV=( "${ARGV[@]:1}" )
 fi
 
-# Ensure the Rust binary exists & is executable
-if [[ -f "./RustDedicated" && ! -x "./RustDedicated" ]]; then
-  chmod +x ./RustDedicated || true
-fi
+# Ensure the Rust binary exists & is executable (ARGV[0] should be ./RustDedicated)
 if [[ ! -f "./RustDedicated" ]]; then
   err "RustDedicated not found in $(pwd). Did app_update install to /home/container?"
   err "Set VALIDATE=1 (or enable AUTO_UPDATE in your egg) and try again."
   exit 13
 fi
+if [[ ! -x "./RustDedicated" ]]; then
+  chmod +x ./RustDedicated || true
+fi
 
-log "Launching via wrapper…"
+log "Launching via wrapper (argv mode)…"
 
 # pick wrapper path (either location is fine)
 WRAPPER="/wrapper.js"
@@ -207,8 +195,7 @@ if [[ ! -f "$WRAPPER" ]]; then
 fi
 
 # -----------------------------------------------------------------------
-# Launch through the console-wrapper (which mirrors logfile to panel)
-# The wrapper runs the string under bash (`shell: /bin/bash`), so the
-# single-quoted args here become the original argv without splitting.
+# Launch through the console-wrapper, passing argv elements directly.
+# No shell here — wrapper will spawn the game with this exact argv array.
 # -----------------------------------------------------------------------
-exec /opt/node/bin/node "${WRAPPER}" "${MODIFIED_STARTUP}"
+exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
