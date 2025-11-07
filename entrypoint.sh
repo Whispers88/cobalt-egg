@@ -3,11 +3,11 @@ set -euo pipefail
 
 # =======================================================================
 # Rust Dedicated Server entrypoint for Pterodactyl (console-first)
-# - Works from /home/container (no symlink)
-# - Quote-safe expansion of panel vars ({{VAR}} -> ${VAR})
+# - Works from /home/container
+# - Quote-safe handling of Start Command args (preserves spaces)
 # - Supports Vanilla / Oxide / Carbon
-# - Optional validate / branch support via env
-# - Launches via wrapper.js which mirrors logfile to console
+# - Validates via SteamCMD (optional)
+# - Launches via wrapper.js which mirrors logfile to panel
 # =======================================================================
 
 export HOME=/home/container
@@ -20,7 +20,7 @@ err() { echo -e "[entrypoint][error] $*" >&2; }
 ulimit -n 65535 || true
 umask 002
 
-# rotate ownership (best-effort, harmless if it fails)
+# best-effort ownership fix (harmless if not needed)
 chown -R "$(id -u):$(id -g)" /home/container 2>/dev/null || true
 
 # -----------------------------------------------------------------------
@@ -55,7 +55,7 @@ EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 STEAM_BRANCH="${STEAM_BRANCH:-}"
 STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"
 
-# wrapper log destination (the wrapper writes raw logs here)
+# wrapper log destination (wrapper writes raw logs here)
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
 # optional convenience IP (panel can override)
@@ -144,10 +144,10 @@ case "${FRAMEWORK}" in
   oxide|uMod) do_validate; install_oxide ;;
   carbon*  ) do_validate; install_carbon ;;
   *        ) do_validate ;;  # vanilla
-esac
+eac
 
 # -----------------------------------------------------------------------
-# Build final startup command
+# Build final startup command (QUOTE-SAFE)
 # Supports:
 #   - Layout A: panel Start Command passes args (/entrypoint.sh ./RustDedicated …)
 #   - Layout B: panel STARTUP env holds the templated string
@@ -155,10 +155,11 @@ esac
 MODIFIED_STARTUP=""
 
 if [[ "$#" -gt 0 ]]; then
-  # Wings already expanded {{VARS}} in Start Command
-  MODIFIED_STARTUP="$*"
+  # Rebuild one string from original args, preserving spaces/quotes
+  MODIFIED_STARTUP="$(printf '%q ' "$@")"
+  MODIFIED_STARTUP="${MODIFIED_STARTUP% }"   # trim trailing space
 else
-  # Expand STARTUP from env, preserving quotes/spaces
+  # STARTUP env expansion: convert {{VAR}} → ${VAR} and expand safely
   if [[ -z "${STARTUP:-}" ]]; then
     err "No startup provided: neither Start Command args nor STARTUP env found."
     exit 12
@@ -168,19 +169,19 @@ else
   )"
 fi
 
-# strip accidental recursion if someone included /entrypoint.sh in STARTUP
+# Strip accidental recursion if someone included /entrypoint.sh in STARTUP
 if [[ "${MODIFIED_STARTUP}" == /entrypoint.sh* ]]; then
   log "Note: stripping leading '/entrypoint.sh' from startup string"
   MODIFIED_STARTUP="${MODIFIED_STARTUP#/entrypoint.sh }"
 fi
 
-# ensure the binary exists & is executable
+# Ensure the Rust binary exists & is executable
 if [[ -f "./RustDedicated" && ! -x "./RustDedicated" ]]; then
   chmod +x ./RustDedicated || true
 fi
 if [[ ! -f "./RustDedicated" ]]; then
   err "RustDedicated not found in $(pwd). Did app_update install to /home/container?"
-  err "Set VALIDATE=1 (or AUTO_UPDATE in your egg) and try again."
+  err "Set VALIDATE=1 (or enable AUTO_UPDATE in your egg) and try again."
   exit 13
 fi
 
