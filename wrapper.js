@@ -1,81 +1,82 @@
 #!/usr/bin/env node
-const fs = require("fs");
+
+// Console-first wrapper with timestamps and logfile mirroring.
+// - Runs the full startup string under /bin/bash (no splitting).
+// - Adds timestamps to panel output only; writes raw to latest.log.
+// - If -logfile is present, tails it and mirrors to the panel.
+
 const { spawn } = require("child_process");
+const fs = require("fs");
 
-const LATEST_LOG = process.env.LATEST_LOG || "latest.log";
+const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
 
-// rotate wrapper log
+// rotate previous log
 try { if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`); } catch {}
 fs.writeFileSync(LATEST_LOG, "", { flag: "w" });
 
+function ts() {
+  const d = new Date();
+  return `[${d.toISOString().split("T")[1].split(".")[0]}]`; // HH:MM:SS
+}
+
 const args = process.argv.slice(2);
 if (!args.length) {
-  console.log("Error: Please provide the startup command as arguments.");
+  console.error("[wrapper] ERROR: No startup command provided.");
   process.exit(1);
 }
 const startupCmd = args.join(" ");
-console.log("Starting Rust via wrapper (Unity console)…");
 
-// Prefer bash so [[ ]] / == / $() in the Start Command work
-const preferredShell = fs.existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
-
-// Detect -logfile path in the startup command
+// detect -logfile path (quoted or unquoted)
 function extractLogfile(cmd) {
-  // matches: -logfile /path OR -logfile "/path with spaces"
   const m = cmd.match(/-logfile\s+("([^"]+)"|(\S+))/);
   if (!m) return null;
   return m[2] || m[3] || null;
 }
 const unityLogfile = extractLogfile(startupCmd);
 
-// Spawn the game (no PTY). If your game only prints with a TTY, we can wrap with `script`.
+console.log(`${ts()} [wrapper] Starting with shell: ${startupCmd}`);
+
+const preferredShell = fs.existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
 const game = spawn(startupCmd, {
-  shell: preferredShell,
+  shell: preferredShell,               // <— IMPORTANT: run the string as-is
   stdio: ["pipe", "pipe", "pipe"],
+  cwd: "/home/container",
 });
 
-// Mirror game stdout/stderr to panel + wrapper log (works when no -logfile)
-function mirror(data) {
-  const s = data.toString();
-  process.stdout.write(s);
-  fs.appendFile(LATEST_LOG, s.replace(/\r/g, ""), () => {});
+function mirrorToPanelAndFile(chunk, isErr = false) {
+  const raw = chunk.toString();
+  const withTs = `${ts()} ${raw}`;
+  (isErr ? process.stderr : process.stdout).write(withTs);
+  fs.appendFile(LATEST_LOG, raw, () => {});
 }
-game.stdout.on("data", mirror);
-game.stderr.on("data", mirror);
 
-// If -logfile is set, tail it and mirror into the panel too
+game.stdout.on("data", (d) => mirrorToPanelAndFile(d, false));
+game.stderr.on("data", (d) => mirrorToPanelAndFile(d, true));
+
+// If the game writes to a logfile, also tail it so the panel sees it.
 let tailProc = null;
 if (unityLogfile) {
-  // Ensure the file exists so tail -F starts cleanly
   try { fs.closeSync(fs.openSync(unityLogfile, "a")); } catch {}
-  console.log(`[wrapper] Detected -logfile: ${unityLogfile} — mirroring to console.`);
+  console.log(`${ts()} [wrapper] Mirroring -logfile: ${unityLogfile}`);
   tailProc = spawn("tail", ["-n", "+1", "-F", unityLogfile], { stdio: ["ignore", "pipe", "pipe"] });
-  const tailMirror = (data) => {
-    const s = data.toString();
-    process.stdout.write(s);
-    fs.appendFile(LATEST_LOG, s.replace(/\r/g, ""), () => {});
-  };
+  const tailMirror = (d) => mirrorToPanelAndFile(d, false);
   tailProc.stdout.on("data", tailMirror);
   tailProc.stderr.on("data", tailMirror);
-  tailProc.on("exit", (c) => console.log(`[wrapper] tail exited (${c}).`));
+  tailProc.on("exit", (c) => console.log(`${ts()} [wrapper] tail exited (${c}).`));
 }
 
-// Forward panel input directly to the Unity console
+// forward panel input → game stdin
 process.stdin.setEncoding("utf8");
-process.stdin.on("data", (text) => {
-  const cmd = String(text || "").replace(/\r?\n$/, "") + "\n";
-  try { game.stdin.write(cmd); } catch {}
-});
+process.stdin.on("data", (txt) => { try { game.stdin.write(txt); } catch {} });
 process.stdin.resume();
 
-// Graceful shutdown
 let exited = false;
-["SIGINT", "SIGTERM"].forEach(sig => {
+["SIGTERM", "SIGINT"].forEach(sig => {
   process.on(sig, () => {
     if (!exited) {
-      console.log(`Received ${sig}, asking server to quit...`);
+      console.log(`${ts()} [wrapper] ${sig} → stopping server...`);
       try { game.stdin.write("quit\n"); } catch {}
-      setTimeout(() => { try { game.kill("SIGTERM"); } catch {} }, 5000);
+      setTimeout(() => { try { game.kill("TERM"); } catch {} }, 5000);
     }
   });
 });
@@ -83,6 +84,6 @@ let exited = false;
 game.on("exit", (code) => {
   exited = true;
   if (tailProc && !tailProc.killed) { try { tailProc.kill("TERM"); } catch {} }
-  console.log("Main game process exited with code", code);
+  console.log(`${ts()} [wrapper] Rust exited with code: ${code}`);
   process.exit(code ?? 0);
 });
