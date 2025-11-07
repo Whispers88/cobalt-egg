@@ -4,7 +4,7 @@ set -euo pipefail
 # =======================================================================
 # Rust Dedicated Server entrypoint for Pterodactyl (console-first, argv-safe)
 # - Works from /home/container
-# - Preserves multi-word values by passing argv array, not a string
+# - Preserves multi-word values by passing argv via a NUL-separated file
 # - Supports Vanilla / Oxide / Carbon
 # - Validates via SteamCMD (optional)
 # - Launches via wrapper.js which mirrors logfile to panel
@@ -184,7 +184,7 @@ if [[ ! -x "./RustDedicated" ]]; then
   chmod +x ./RustDedicated || true
 fi
 
-log "Launching via wrapper (argv mode)…"
+log "Launching via wrapper (argv-file mode)…"
 
 # pick wrapper path (either location is fine)
 WRAPPER="/wrapper.js"
@@ -195,7 +195,11 @@ if [[ ! -f "$WRAPPER" ]]; then
 fi
 
 # -----------------------------------------------------------------------
-# Launch through the console-wrapper, passing argv elements directly.
-# No shell here — wrapper will spawn the game with this exact argv array.
+# Launch through the console-wrapper, writing argv to a NUL-separated file
+# and passing it with --argv-file (no shell re-parsing anywhere).
 # -----------------------------------------------------------------------
-exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
+ARGS_FILE="$(mktemp -p /home/container args.XXXXXXXX.nul)"
+# shellcheck disable=SC2059
+printf '%s\0' "${ARGV[@]}" > "${ARGS_FILE}"
+
+exec /opt/node/bin/node "$WRAPPER" --argv-file "${ARGS_FILE}"
