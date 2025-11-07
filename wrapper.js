@@ -27,8 +27,13 @@ function filter(data) {
   process.stdout.write(str);
 }
 
-// Use shell=true so quoted args in STARTUP work properly
-const gameProcess = spawn(startupCmd, { shell: true, stdio: ["pipe", "pipe", "pipe"] });
+// ---- IMPORTANT CHANGE: run under bash if available ----
+const preferredShell = fs.existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
+// Use -lc so env/aliases are loaded and the whole string runs as one command
+const gameProcess = spawn(startupCmd, {
+  shell: preferredShell,
+  stdio: ["pipe", "pipe", "pipe"]
+});
 
 gameProcess.stdout.on("data", filter);
 gameProcess.stderr.on("data", filter);
