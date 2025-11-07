@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
-# Pterodactyl Install Script for Rust (works with Node-based images expecting /home/container/wrapper.js)
-# Server files live at /mnt/server (mounted at /home/container at runtime)
 
 set -euo pipefail
-
-if [ -d /mnt/server ]; then
-  if [ ! -L /home/container ]; then
-    rm -rf /home/container 2>/dev/null || true
-    ln -s /mnt/server /home/container
-  fi
-fi
-
 SRCDS_APPID="258550"
 
 log() { echo "[install] $*"; }
