@@ -62,7 +62,7 @@ RUN set -eux; \
   mkdir -p /home/container/steamcmd /home/container/.steam/sdk32 /home/container/.steam/sdk64 /home/container/bin; \
   chown -R container:container /home/container
 
-WORKDIR /home/container
+WORKDIR /mnt/server
 
 # Default environment values
 ENV FRAMEWORK=vanilla \
