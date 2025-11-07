@@ -144,7 +144,7 @@ case "${FRAMEWORK}" in
   oxide|uMod) do_validate; install_oxide ;;
   carbon*  ) do_validate; install_carbon ;;
   *        ) do_validate ;;  # vanilla
-eac
+esac
 
 # -----------------------------------------------------------------------
 # Build final startup command (QUOTE-SAFE)
