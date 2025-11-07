@@ -4,8 +4,7 @@ set -euo pipefail
 # =======================================================================
 # Rust Dedicated Server entrypoint for Pterodactyl (console-first, argv-safe)
 # - Works from /home/container
-# - Preserves multi-word values by repairing split tokens and passing
-#   a NUL-separated argv file to wrapper.js (no re-splitting)
+# - Preserves multi-word values by passing argv array, not a string
 # - Supports Vanilla / Oxide / Carbon
 # - Validates via SteamCMD (optional)
 # - Launches via wrapper.js which mirrors logfile to panel
@@ -146,7 +145,10 @@ case "${FRAMEWORK}" in
 esac
 
 # -----------------------------------------------------------------------
-# Build argv to pass to wrapper (start-command or STARTUP)
+# Build argv to pass to wrapper (NO STRING JOINING)
+# Supports:
+#   - Layout A: panel Start Command passes args (/entrypoint.sh ./RustDedicated …)
+#   - Layout B: panel STARTUP env holds the templated string
 # -----------------------------------------------------------------------
 
 # If args were passed after /entrypoint.sh, use them as-is.
@@ -172,42 +174,17 @@ if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then
   ARGV=( "${ARGV[@]:1}" )
 fi
 
-# ---- REPAIR PASS: rejoin values that were split by the panel/shell ----
-# Treat both '-' and '+' prefixed tokens as flags.
-is_flag() { [[ "$1" == -* || "$1" == +* ]]; }
-
-repaired=()
-i=0
-while [[ $i -lt ${#ARGV[@]} ]]; do
-  tok="${ARGV[$i]}"
-  if is_flag "$tok"; then
-    repaired+=("$tok")
-    ((i++))
-    if [[ $i -lt ${#ARGV[@]} ]]; then
-      val="${ARGV[$i]}"; ((i++))
-      # Keep joining until next token *looks like* a flag (-or+ prefix)
-      while [[ $i -lt ${#ARGV[@]} && ! "${ARGV[$i]}" =~ ^[-+][A-Za-z0-9_.-]+$ ]]; do
-        val+=" ${ARGV[$i]}"
-        ((i++))
-      done
-      repaired+=("$val")
-    fi
-  else
-    repaired+=("$tok")
-    ((i++))
-  fi
-done
-ARGV=( "${repaired[@]}" )
-
 # Ensure the Rust binary exists & is executable (ARGV[0] should be ./RustDedicated)
 if [[ ! -f "./RustDedicated" ]]; then
   err "RustDedicated not found in $(pwd). Did app_update install to /home/container?"
   err "Set VALIDATE=1 (or enable AUTO_UPDATE in your egg) and try again."
   exit 13
 fi
-[[ -x "./RustDedicated" ]] || chmod +x ./RustDedicated || true
+if [[ ! -x "./RustDedicated" ]]; then
+  chmod +x ./RustDedicated || true
+fi
 
-log "Launching via wrapper (argv-file mode)…"
+log "Launching via wrapper (argv mode)…"
 
 # pick wrapper path (either location is fine)
 WRAPPER="/wrapper.js"
@@ -218,29 +195,7 @@ if [[ ! -f "$WRAPPER" ]]; then
 fi
 
 # -----------------------------------------------------------------------
-# Write argv to a NUL-separated file and pass it to the wrapper.
-# This prevents any further splitting of multi-word values.
+# Launch through the console-wrapper, passing argv elements directly.
+# No shell here — wrapper will spawn the game with this exact argv array.
 # -----------------------------------------------------------------------
-ARGS_FILE="$(mktemp -p /home/container args.XXXXXXXX.nul)"
-# shellcheck disable=SC2059
-printf '%s\0' "${ARGV[@]}" > "${ARGS_FILE}"
-
-# Find Node (prefer /opt path, else PATH)
-NODE_BIN="/opt/node/bin/node"
-if [[ ! -x "${NODE_BIN}" ]]; then
-  if command -v node >/dev/null 2>&1; then
-    NODE_BIN="$(command -v node)"
-  else
-    err "NodeJS not found. Tried /opt/node/bin/node and PATH."
-    exit 15
-  fi
-fi
-
-# Optional breadcrumbs (handy if something still fails very early)
-log "Using node: ${NODE_BIN}"
-log "Wrapper: ${WRAPPER}"
-log "Args file: ${ARGS_FILE} ($(wc -c < "${ARGS_FILE}") bytes)"
-{ printf "[entrypoint] argv[0..7] preview:"; tr '\0' '\n' < "${ARGS_FILE}" | head -n 8 | sed 's/^/ /'; } || true
-
-# Exec wrapper (no shell re-parsing)
-exec "${NODE_BIN}" "${WRAPPER}" --argv-file "${ARGS_FILE}"
+exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
