@@ -2,8 +2,7 @@
 
 // ============================================================================
 // Rust wrapper -- Console-first (NO RCON), argv-safe + logfile mirroring
-// - Accepts argv via --argv-file (NUL/newline), --argv-json, --argv-b64,
-//   or legacy --argv <args...>
+// - Receives argv for RustDedicated via --argv <args...>
 // - Spawns RustDedicated WITHOUT a shell (preserves multi-word args)
 // - Mirrors stdout/stderr to panel, writes raw to latest.log
 // - If -logfile is present, tails it and mirrors to panel too
@@ -16,94 +15,29 @@ const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
 
 // rotate previous log
 try { if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`); } catch {}
-try { fs.writeFileSync(LATEST_LOG, "", { flag: "w" }); } catch (e) {
-  console.error(`[wrapper] ERROR: unable to open ${LATEST_LOG}: ${e.message}`);
-}
+fs.writeFileSync(LATEST_LOG, "", { flag: "w" });
 
 const argv = process.argv.slice(2);
 
-function decodeArgv() {
-  // --argv-json
-  let i = argv.indexOf("--argv-json");
-  if (i !== -1 && argv[i + 1]) {
-    try {
-      const arr = JSON.parse(argv[i + 1]);
-      if (!Array.isArray(arr) || arr.length === 0) throw new Error();
-      return arr.map(String);
-    } catch {
-      console.error("[wrapper] ERROR: --argv-json must be a JSON array of strings.");
-      process.exit(1);
-    }
-  }
-  // --argv-b64
-  i = argv.indexOf("--argv-b64");
-  if (i !== -1 && argv[i + 1]) {
-    try {
-      const json = Buffer.from(argv[i + 1], "base64").toString("utf8");
-      const arr = JSON.parse(json);
-      if (!Array.isArray(arr) || arr.length === 0) throw new Error();
-      return arr.map(String);
-    } catch {
-      console.error("[wrapper] ERROR: --argv-b64 must be base64 of a JSON array of strings.");
-      process.exit(1);
-    }
-  }
-  // --argv-file
-  i = argv.indexOf("--argv-file");
-  if (i !== -1 && argv[i + 1]) {
-    try {
-      const buf = fs.readFileSync(argv[i + 1]);
-      let parts = buf.toString("utf8").split("\0").filter(s => s.length > 0);
-      if (parts.length <= 1) {
-        parts = buf.toString("utf8").split(/\r?\n/).filter(s => s.length > 0);
-      }
-      if (parts.length === 0) throw new Error("empty");
-      return parts.map(String);
-    } catch (e) {
-      console.error(`[wrapper] ERROR: --argv-file must be readable (NUL/newline-separated): ${e.message || e}`);
-      process.exit(1);
-    }
-  }
-  // env JSON
-  if (process.env.RUST_ARGS_JSON) {
-    try {
-      const arr = JSON.parse(process.env.RUST_ARGS_JSON);
-      if (!Array.isArray(arr) || arr.length === 0) throw new Error();
-      return arr.map(String);
-    } catch {
-      console.error("[wrapper] ERROR: RUST_ARGS_JSON must be a JSON array of strings.");
-      process.exit(1);
-    }
-  }
-  // legacy --argv
-  const flagIndex = argv.indexOf("--argv");
-  if (flagIndex === -1) {
-    console.error("[wrapper] ERROR: Missing argv source. Use --argv-file/--argv-json/--argv-b64 or RUST_ARGS_JSON (or legacy --argv).");
-    process.exit(1);
-  }
-  const legacy = argv.slice(flagIndex + 1);
-  if (legacy.length === 0) {
-    console.error("[wrapper] ERROR: No arguments provided for RustDedicated.");
-    process.exit(1);
-  }
-  return legacy.map(String);
-}
-
-const fullArgv = decodeArgv();
-const executable = fullArgv[0];
-const params = fullArgv.slice(1);
-
-if (!executable) {
-  console.error("[wrapper] ERROR: First argv element must be the RustDedicated binary.");
+// Expect "--argv" followed by the full RustDedicated argv
+const flagIndex = argv.indexOf("--argv");
+if (flagIndex === -1) {
+  console.error("[wrapper] ERROR: Missing --argv marker.");
   process.exit(1);
 }
 
-console.log(
-  `[wrapper] Executing: ${executable} ` +
-  params.map(a => (/[^A-Za-z0-9_/.:-]/.test(a) ? `"${a}"` : a)).join(" ")
-);
+const gameArgs = argv.slice(flagIndex + 1);
+if (gameArgs.length === 0) {
+  console.error("[wrapper] ERROR: No arguments provided for RustDedicated.");
+  process.exit(1);
+}
 
-// Detect -logfile path
+const executable = gameArgs[0];
+const params = gameArgs.slice(1);
+
+console.log(`[wrapper] Executing: ${executable} ${params.map(a => (/[^A-Za-z0-9_/.:-]/.test(a) ? `"${a}"` : a)).join(" ")}`);
+
+// Detect -logfile path (next token is the path)
 let unityLogfile = null;
 for (let i = 0; i < params.length; i++) {
   if (params[i] === "-logfile" && i + 1 < params.length) {
@@ -112,7 +46,7 @@ for (let i = 0; i < params.length; i++) {
   }
 }
 
-// Spawn WITHOUT shell
+// Spawn WITHOUT shell: exact argv preserved
 const game = spawn(executable, params, {
   stdio: ["pipe", "pipe", "pipe"],
   cwd: "/home/container",
@@ -127,7 +61,7 @@ function mirror(chunk, isErr = false) {
 game.stdout.on("data", (d) => mirror(d, false));
 game.stderr.on("data", (d) => mirror(d, true));
 
-// Mirror -logfile too
+// If -logfile is set, tail it and mirror to the panel too
 let tailProc = null;
 if (unityLogfile) {
   try { fs.closeSync(fs.openSync(unityLogfile, "a")); } catch {}
@@ -139,7 +73,7 @@ if (unityLogfile) {
   tailProc.on("exit", (c) => console.log(`[wrapper] tail exited (${c}).`));
 }
 
-// Panel input → server stdin
+// Forward panel input → server stdin
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (txt) => {
   try { game.stdin.write(txt); } catch {}

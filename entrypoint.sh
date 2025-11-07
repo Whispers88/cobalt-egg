@@ -1,40 +1,36 @@
 #!/bin/bash
 set -euo pipefail
 
+# =======================================================================
+# Rust Dedicated Server entrypoint for Pterodactyl (console-first, argv-safe)
+# - Works from /home/container
+# - Preserves multi-word values by passing argv array, not a string
+# - Supports Vanilla / Oxide / Carbon
+# - Validates via SteamCMD (optional)
+# - Launches via wrapper.js which mirrors logfile to panel
+# =======================================================================
+
 export HOME=/home/container
 cd /home/container || exit 1
 
 log() { echo -e "[entrypoint] $*"; }
+err() { echo -e "[entrypoint][error] $*" >&2; }
 
-# Fix permissions (in case Pterodactyl mounts as root)
-chown -R "$(id -u)" "$(pwd)" 2>/dev/null || true
-
-# Increase file handles (avoid Rust IO errors)
+# niceties
 ulimit -n 65535 || true
 umask 002
+chown -R "$(id -u):$(id -g)" /home/container 2>/dev/null || true
 
-#------------------------------------------------------------------------
-# SteamCMD / Framework handling (Vanilla / Oxide / Carbon)
-#------------------------------------------------------------------------
-
-CURL="curl -fSL --retry 5 --retry-delay 2 --connect-timeout 15"
-
-SRCDS_APPID="${SRCDS_APPID:-258550}"
-STEAM_USER="${STEAM_USER:-anonymous}"
-STEAM_PASS="${STEAM_PASS:-}"
-STEAM_AUTH="${STEAM_AUTH:-}"
-
-FRAMEWORK="${FRAMEWORK:-vanilla}"
-VALIDATE="${VALIDATE:-1}"
-EXTRA_FLAGS="${EXTRA_FLAGS:-}"
-STEAM_BRANCH="${STEAM_BRANCH:-}"
-STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"
-
+# -----------------------------------------------------------------------
+# SteamCMD layout
+# -----------------------------------------------------------------------
 mkdir -p \
   /home/container/Steam/package \
   /home/container/steamcmd \
   /home/container/.steam/sdk32 \
   /home/container/.steam/sdk64
+
+export STEAMCMDDIR=/home/container/steamcmd
 
 steamcmd_path() {
   if [[ -x "/home/container/steamcmd/steamcmd.sh" ]]; then echo "/home/container/steamcmd/steamcmd.sh"; return; fi
@@ -42,69 +38,164 @@ steamcmd_path() {
   echo ""
 }
 
-validate_now() {
-  [[ "$VALIDATE" != "1" ]] && return
+# -----------------------------------------------------------------------
+# Config from panel
+# -----------------------------------------------------------------------
+SRCDS_APPID="${SRCDS_APPID:-258550}"
 
+STEAM_USER="${STEAM_USER:-anonymous}"
+STEAM_PASS="${STEAM_PASS:-}"
+STEAM_AUTH="${STEAM_AUTH:-}"
+
+FRAMEWORK="${FRAMEWORK:-vanilla}"      # vanilla | oxide | carbon* (edge/staging/auxX, *-minimal)
+VALIDATE="${VALIDATE:-1}"
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"
+STEAM_BRANCH="${STEAM_BRANCH:-}"
+STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"
+
+# wrapper log destination (wrapper writes raw logs here)
+export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
+
+# optional convenience IP (panel can override)
+if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
+  APP_PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  export APP_PUBLIC_IP
+fi
+
+# -----------------------------------------------------------------------
+# Update / validate
+# -----------------------------------------------------------------------
+do_validate() {
+  [[ "${VALIDATE}" != "1" ]] && return 0
   local SCMD; SCMD="$(steamcmd_path)"
-  [[ -z "$SCMD" ]] && { log "ERROR: steamcmd not found"; exit 11; }
+  [[ -z "$SCMD" ]] && { err "steamcmd not found"; exit 11; }
 
   local BRANCH_FLAGS=""
   [[ -n "$STEAM_BRANCH" ]] && BRANCH_FLAGS="-beta ${STEAM_BRANCH}"
   [[ -n "$STEAM_BRANCH_PASS" ]] && BRANCH_FLAGS="${BRANCH_FLAGS} -betapassword ${STEAM_BRANCH_PASS}"
 
-  log "Validation started..."
-  "$SCMD" +force_install_dir /home/container +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
-    +app_update "${SRCDS_APPID}" ${BRANCH_FLAGS} ${EXTRA_FLAGS} validate +quit
-  log "[ OK ] validation complete"
+  log "Validating game files via SteamCMD…"
+  "$SCMD" +force_install_dir /home/container \
+         +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
+         +app_update "${SRCDS_APPID}" ${BRANCH_FLAGS} ${EXTRA_FLAGS} validate \
+         +quit
+  log "[  OK  ] validation complete"
 }
 
 install_oxide() {
-  log "Installing/Updating Oxide (uMod)..."
-  tmpdir="$(mktemp -d)"
-  pushd "$tmpdir" >/dev/null
-  $CURL -o oxide.zip "https://umod.org/games/rust/download?build=linux"
-  unzip -o oxide.zip -d /home/container >/dev/null
+  log "Installing / updating Oxide (uMod)…"
+  local tmp; tmp="$(mktemp -d)"
+  pushd "$tmp" >/dev/null
+  curl -fSL --retry 5 -o oxide.zip "https://umod.org/games/rust/download?build=linux"
+  unzip -o -q oxide.zip -d /home/container
   popd >/dev/null
-  rm -rf "$tmpdir"
+  rm -rf "$tmp"
   log "uMod install complete."
 }
 
 install_carbon() {
-  log "Installing Carbon..."
-  tmpdir="$(mktemp -d)"
-  pushd "$tmpdir" >/dev/null
-  $CURL -o carbon.tar.gz "https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.tar.gz"
+  log "Installing / updating Carbon…"
+  local channel="production" minimal="0" url=""
+  case "${FRAMEWORK}" in
+    carbon-edge* )    channel="edge" ;;
+    carbon-staging* ) channel="staging" ;;
+    carbon-aux1* )    channel="aux1" ;;
+    carbon-aux2* )    channel="aux2" ;;
+    carbon* )         channel="production" ;;
+  esac
+  [[ "${FRAMEWORK}" == *"-minimal" ]] && minimal="1"
+
+  if [[ "$minimal" == "1" ]]; then
+    case "${channel}" in
+      production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.Minimal.tar.gz" ;;
+      edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.Minimal.tar.gz" ;;
+      staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.Minimal.tar.gz" ;;
+      aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1.Minimal.tar.gz" ;;
+      aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.Minimal.tar.gz" ;;
+    esac
+  else
+    case "${channel}" in
+      production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.tar.gz" ;;
+      edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.tar.gz" ;;
+      staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.tar.gz" ;;
+      aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1.tar.gz" ;;
+      aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.tar.gz" ;;
+    esac
+  fi
+
+  if [[ -z "${url}" ]]; then
+    err "Could not determine Carbon artifact for FRAMEWORK='${FRAMEWORK}'"
+    exit 10
+  fi
+
+  local tmp; tmp="$(mktemp -d)"
+  pushd "$tmp" >/dev/null
+  curl -fSL --retry 5 -o carbon.tar.gz "${url}"
   tar -xzf carbon.tar.gz -C /home/container
   popd >/dev/null
-  rm -rf "$tmpdir"
-  log "Carbon installed."
+  rm -rf "$tmp"
+  log "Carbon install complete."
 }
 
-case "$FRAMEWORK" in
-  oxide|uMod) validate_now; install_oxide ;;
-  carbon*)    validate_now; install_carbon ;;
-  *)          validate_now ;;  # vanilla
+# run chosen framework steps
+case "${FRAMEWORK}" in
+  oxide|uMod) do_validate; install_oxide ;;
+  carbon*  ) do_validate; install_carbon ;;
+  *        ) do_validate ;;  # vanilla
 esac
 
-#------------------------------------------------------------------------
-# STARTUP variable expansion (critical for Pterodactyl)
-#------------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# Build argv to pass to wrapper (NO STRING JOINING)
+# Supports:
+#   - Layout A: panel Start Command passes args (/entrypoint.sh ./RustDedicated …)
+#   - Layout B: panel STARTUP env holds the templated string
+# -----------------------------------------------------------------------
 
-if [[ -z "${STARTUP:-}" ]]; then
-  log "ERROR: No STARTUP command provided."
-  exit 12
+# If args were passed after /entrypoint.sh, use them as-is.
+if [[ "$#" -gt 0 ]]; then
+  ARGV=( "$@" )
+else
+  # STARTUP env expansion: convert {{VAR}} → ${VAR}, expand, then parse into argv
+  if [[ -z "${STARTUP:-}" ]]; then
+    err "No startup provided: neither Start Command args nor STARTUP env found."
+    exit 12
+  fi
+  # Expand panel variables while preserving quotes
+  EXPANDED="$(
+    eval "echo \"$(printf '%s' "${STARTUP}" | sed -e 's/{{/${/g' -e 's/}}/}/g')\""
+  )"
+  # Parse EXPANDED into $1..$N (argv) using the shell's own parser
+  eval "set -- ${EXPANDED}"
+  ARGV=( "$@" )
 fi
 
-MODIFIED_STARTUP=$(eval echo $(echo "$STARTUP" | sed -e 's/{{/${/g' -e 's/}}/}/g'))
-MODIFIED_STARTUP="${MODIFIED_STARTUP#/entrypoint.sh }"
+# If someone accidentally included /entrypoint.sh, strip it.
+if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then
+  ARGV=( "${ARGV[@]:1}" )
+fi
 
-log "Launching via wrapper: $MODIFIED_STARTUP"
+# Ensure the Rust binary exists & is executable (ARGV[0] should be ./RustDedicated)
+if [[ ! -f "./RustDedicated" ]]; then
+  err "RustDedicated not found in $(pwd). Did app_update install to /home/container?"
+  err "Set VALIDATE=1 (or enable AUTO_UPDATE in your egg) and try again."
+  exit 13
+fi
+if [[ ! -x "./RustDedicated" ]]; then
+  chmod +x ./RustDedicated || true
+fi
 
+log "Launching via wrapper (argv mode)…"
+
+# pick wrapper path (either location is fine)
 WRAPPER="/wrapper.js"
-[[ ! -f "$WRAPPER" ]] && WRAPPER="/opt/cobalt/wrapper.js"
-[[ ! -f "$WRAPPER" ]] && { echo "[entrypoint] ERROR: wrapper.js not found!"; exit 14; }
+[[ -f "$WRAPPER" ]] || WRAPPER="/opt/cobalt/wrapper.js"
+if [[ ! -f "$WRAPPER" ]]; then
+  err "wrapper.js not found at /wrapper.js or /opt/cobalt/wrapper.js"
+  exit 14
+fi
 
-#------------------------------------------------------------------------
-# Launch server (console streaming to Pterodactyl)
-#------------------------------------------------------------------------
-exec /opt/node/bin/node "$WRAPPER" "$MODIFIED_STARTUP"
+# -----------------------------------------------------------------------
+# Launch through the console-wrapper, passing argv elements directly.
+# No shell here — wrapper will spawn the game with this exact argv array.
+# -----------------------------------------------------------------------
+exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
