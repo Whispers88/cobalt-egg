@@ -6,33 +6,35 @@ const WebSocket = require("ws");
 const LATEST_LOG = process.env.LATEST_LOG || "latest.log";
 const FORCE_CONSOLE = process.env.CONSOLE_MODE === "1";
 
+// Prepare log file
 try { if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`); } catch {}
 fs.writeFile(LATEST_LOG, "", (err) => { if (err) console.log("Log init error:", err); });
 
 const args = process.argv.slice(2);
 if (!args.length) {
-  console.log("Error: Please provide the startup command as arguments.");
+  console.log("Error: Please specify a startup command.");
   process.exit(1);
 }
-
-// Rebuild the command exactly as it was typed in the Panel
 const startupCmd = args.join(" ");
 console.log("Starting Rust via wrapper…");
 
-// Prefer bash so panel Start Command can use [[ ]] / == / $()
+// Use bash if available so STARTUP strings with [[ ]] / == work
 const preferredShell = fs.existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
+
+// Spawn the game process via the shell to preserve quoting
 const gameProcess = spawn(startupCmd, {
   shell: preferredShell,
   stdio: ["pipe", "pipe", "pipe"],
 });
 
+// Deduplicate a noisy line pattern from Rust boot
 const seenPercentage = {};
 function filter(data) {
   const str = data.toString();
   if (str.startsWith("Loading Prefab Bundle ")) {
-    const pct = str.slice("Loading Prefab Bundle ".length);
-    if (seenPercentage[pct]) return;
-    seenPercentage[pct] = true;
+    const percentage = str.slice("Loading Prefab Bundle ".length);
+    if (seenPercentage[percentage]) return;
+    seenPercentage[percentage] = true;
   }
   process.stdout.write(str);
 }
@@ -47,6 +49,7 @@ gameProcess.on("exit", (code) => {
   process.exit(code ?? 0);
 });
 
+// Graceful stop on container signals
 ["SIGINT", "SIGTERM"].forEach(sig => {
   process.on(sig, () => {
     if (!exited) {
@@ -56,24 +59,35 @@ gameProcess.on("exit", (code) => {
   });
 });
 
-// ---- Console mode (direct stdin/stdout) or RCON bridge ----
+// ---- Console mode: forward stdin directly to the game ----
 function enableConsoleMode() {
-  console.log("Console mode enabled (stdin/stdout).");
+  console.log("Console mode enabled (direct stdin/stdout, no RCON).");
   process.stdin.resume();
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (text) => {
     const cmd = String(text || "").replace(/\r?\n$/, "");
-    if (!exited) { try { gameProcess.stdin.write(cmd + "\n"); } catch {} }
+    if (cmd === "quit") {
+      gameProcess.kill("SIGTERM");
+      return;
+    }
+    // Forward command + newline to the game process
+    try { gameProcess.stdin.write(cmd + "\n"); } catch {}
   });
 }
 
+// ---- RCON mode: stdin goes to WebRCON when connected ----
 function enableRconMode() {
   const host = process.env.RCON_IP || "127.0.0.1";
   const port = process.env.RCON_PORT;
   const pass = process.env.RCON_PASS;
-  if (!port || !pass) return enableConsoleMode();
 
-  console.log(`RCON mode enabled (ws://${host}:${port}/••••). Waiting…`);
+  if (!port || !pass) {
+    console.log("RCON not fully configured; falling back to console mode.");
+    enableConsoleMode();
+    return;
+  }
+
+  console.log(`RCON mode enabled (ws://${host}:${port}/••••). Waiting for WebRCON…`);
 
   let waiting = true;
   let delay = 3000;
@@ -84,9 +98,14 @@ function enableRconMode() {
   const createPacket = (command) =>
     JSON.stringify({ Identifier: -1, Message: command, Name: "WebRcon" });
 
+  // Buffer stdin until RCON is ready
   function initialListener(data) {
     const command = data.toString().trim();
-    console.log(`Console not ready yet, queued: "${command}"`);
+    if (command === "quit") {
+      gameProcess.kill("SIGTERM");
+    } else {
+      console.log(`Console not ready yet, queued: "${command}"`);
+    }
   }
   process.stdin.resume();
   process.stdin.setEncoding("utf8");
@@ -98,12 +117,19 @@ function enableRconMode() {
     ws.on("open", () => {
       waiting = false;
       console.log("Connected to WebRCON.");
+
+      // Kick status to unstick console output
       ws.send(createPacket("status"));
 
+      // Rewire stdin to send commands over RCON
       process.stdin.removeListener("data", initialListener);
       process.stdin.on("data", (text) => {
         const cmd = String(text || "").trim();
-        if (cmd.length) ws.send(createPacket(cmd));
+        if (cmd === "quit") {
+          gameProcess.kill("SIGTERM");
+        } else if (cmd.length) {
+          ws.send(createPacket(cmd));
+        }
       });
     });
 
@@ -134,5 +160,9 @@ function enableRconMode() {
   })();
 }
 
-if (FORCE_CONSOLE) enableConsoleMode();
-else enableRconMode();
+// Choose mode
+if (FORCE_CONSOLE) {
+  enableConsoleMode();
+} else {
+  enableRconMode();
+}
