@@ -5,11 +5,15 @@ set -euo pipefail
 # Rust Dedicated Server entrypoint (no symlink), using /home/container
 # ------------------------------------------------------------
 
-# Run everything from the Wings-mounted server volume
 export HOME=/home/container
 cd /home/container
 
-log() { echo -e "[entrypoint] $*"; }
+# --- helpers ---
+log()     { echo -e "[entrypoint] $*"; }
+Debug()   { [[ "${DEBUG:-0}" == "1" ]] && echo -e "[debug] $*"; }
+Success() { echo -e "[  OK  ] $*"; }
+Warn()    { echo -e "[warn]  $*"; }
+Err()     { echo -e "[error] $*" >&2; }
 
 # Niceties
 ulimit -n 65535 || true
@@ -17,7 +21,6 @@ umask 002
 
 # ------------------------------------------------------------
 # SteamCMD preflight for /home/container layout
-# Steam uses $HOME/Steam/...; we ensure dirs exist under /home/container
 # ------------------------------------------------------------
 mkdir -p \
   /home/container/Steam/package \
@@ -26,10 +29,7 @@ mkdir -p \
   /home/container/.steam/sdk32 \
   /home/container/.steam/sdk64
 
-# Ensure the unprivileged user can write to the mounted volume
 chown -R "$(id -u)":"$(id -g)" /home/container || true
-
-# Hint SteamCMD to keep cache/tools here (optional but useful)
 export STEAMCMDDIR=/home/container/steamcmd
 
 # ------------------------------------------------------------
@@ -38,7 +38,6 @@ export STEAMCMDDIR=/home/container/steamcmd
 CURL="curl -fSL --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 0"
 
 SRCDS_APPID="${SRCDS_APPID:-258550}"
-
 STEAM_USER="${STEAM_USER:-anonymous}"
 STEAM_PASS="${STEAM_PASS:-}"
 STEAM_AUTH="${STEAM_AUTH:-}"
@@ -50,10 +49,12 @@ EXTRA_FLAGS="${EXTRA_FLAGS:-}"              # extra args for +app_update
 STEAM_BRANCH="${STEAM_BRANCH:-}"            # branch name (optional)
 STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"  # branch password (optional)
 
-STARTUP="${STARTUP:-}"                      # Pterodactyl STARTUP string
+STARTUP="${STARTUP:-}"                      # Pterodactyl STARTUP string from the panel
 
-# Log file (lives on the mounted volume)
+# Logging
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
+DEBUG="${DEBUG:-0}"                         # set DEBUG=1 to print expanded command
+MASK_SECRETS="${MASK_SECRETS:-1}"           # mask obvious secrets in debug echo
 
 # Optional public IP detection
 if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
@@ -144,10 +145,8 @@ install_carbon() {
 }
 
 steamcmd_path() {
-  # Prefer SteamCMD on the mounted volume if present
   if [[ -x "/home/container/steamcmd/steamcmd.sh" ]]; then echo "/home/container/steamcmd/steamcmd.sh"; return; fi
   if [[ -x "/home/container/steamcmd.sh" ]]; then echo "/home/container/steamcmd.sh"; return; fi
-  # Common locations from cm2network images
   if [[ -x "/home/steam/steamcmd/steamcmd.sh" ]]; then echo "/home/steam/steamcmd/steamcmd.sh"; return; fi
   if command -v steamcmd >/dev/null 2>&1; then command -v steamcmd; return; fi
   if [[ -x "/usr/games/steamcmd" ]]; then echo "/usr/games/steamcmd"; return; fi
@@ -204,12 +203,35 @@ esac
 # Ensure at least one validation if requested
 validate_now
 
-# Require a startup command
+# ------------------------------------------------------------
+# Expand Panel STARTUP: {{VAR}} -> ${VAR} then eval echo
+# ------------------------------------------------------------
 if [[ -z "${STARTUP}" ]]; then
-  log "ERROR: No STARTUP command provided."
+  Err "No STARTUP command provided by panel."
   exit 12
 fi
 
-log "Launching server via wrapper: ${STARTUP}"
-# Pass LATEST_LOG so wrapper writes inside the mounted volume
-exec env LATEST_LOG="${LATEST_LOG}" /opt/node/bin/node /opt/cobalt/wrapper.js "${STARTUP}"
+# Convert braces and expand with current environment.
+# The printf layer protects existing quotes inside STARTUP.
+MODIFIED_STARTUP="$(
+  eval "echo \"$(printf '%s' "${STARTUP}" | sed -e 's/{{/${/g' -e 's/}}/}/g')\""
+)"
+
+# Optional debug print (like yolks). Mask obvious secrets by default.
+if [[ "${DEBUG}" == "1" ]]; then
+  TO_SHOW="${MODIFIED_STARTUP}"
+  if [[ "${MASK_SECRETS}" == "1" ]]; then
+    # Mask +rcon.password "..." and -logfile "..."
+    TO_SHOW="$(echo "${TO_SHOW}" \
+      | sed -E 's/(\+rcon\.password\s+)"[^"]*"/\1"******"/g' \
+      | sed -E 's/(-logfile\s+)"[^"]*"/\1"******"/g')"
+  fi
+  Debug ":/home/container$ ${TO_SHOW}"
+fi
+Success "Variables replaced!"
+
+# ------------------------------------------------------------
+# Launch via wrapper with expanded command
+# (wrapper will run it under bash so [[ ]] / == / $() works)
+# ------------------------------------------------------------
+exec env LATEST_LOG="${LATEST_LOG}" /opt/node/bin/node /opt/cobalt/wrapper.js "${MODIFIED_STARTUP}"
