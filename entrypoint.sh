@@ -2,12 +2,11 @@
 set -euo pipefail
 
 # =======================================================================
-# Rust Dedicated Server entrypoint for Pterodactyl (console-first, argv-safe)
-# - Works from /home/container
-# - Preserves multi-word values by passing argv via a NUL-separated file
-# - Supports Vanilla / Oxide / Carbon
-# - Validates via SteamCMD (optional)
-# - Launches via wrapper.js which mirrors logfile to panel
+# Rust Dedicated Server entrypoint for Pterodactyl (argv-safe)
+# - Uses env-provided argv (JSON/Base64/file) if available (zero splitting)
+# - Otherwise parses panel Start Command/STARTUP and repairs split values
+# - Installs/validates Vanilla / Oxide / Carbon
+# - Launches via wrapper.js, which tails -logfile and mirrors output
 # =======================================================================
 
 export HOME=/home/container
@@ -145,48 +144,117 @@ case "${FRAMEWORK}" in
 esac
 
 # -----------------------------------------------------------------------
-# Build argv to pass to wrapper (NO STRING JOINING)
-# Supports:
-#   - Layout A: panel Start Command passes args (/entrypoint.sh ./RustDedicated …)
-#   - Layout B: panel STARTUP env holds the templated string
+# Build argv to pass to wrapper
+# Priority:
+#   1) RUST_ARGS_FILE (NUL/newline-separated)
+#   2) RUST_ARGS_B64 (base64 of JSON array)
+#   3) RUST_ARGS_JSON (JSON array)
+#   4) "$@" (Start Command tokens) or STARTUP expansion -> with repair pass
 # -----------------------------------------------------------------------
 
-# If args were passed after /entrypoint.sh, use them as-is.
-if [[ "$#" -gt 0 ]]; then
-  ARGV=( "$@" )
-else
-  # STARTUP env expansion: convert {{VAR}} → ${VAR}, expand, then parse into argv
-  if [[ -z "${STARTUP:-}" ]]; then
-    err "No startup provided: neither Start Command args nor STARTUP env found."
-    exit 12
-  fi
-  # Expand panel variables while preserving quotes
-  EXPANDED="$(
-    eval "echo \"$(printf '%s' "${STARTUP}" | sed -e 's/{{/${/g' -e 's/}}/}/g')\""
-  )"
-  # Parse EXPANDED into $1..$N (argv) using the shell's own parser
-  eval "set -- ${EXPANDED}"
-  ARGV=( "$@" )
+ARGV=()
+
+# 1) File
+if [[ -n "${RUST_ARGS_FILE:-}" && -f "${RUST_ARGS_FILE}" ]]; then
+  mapfile -d '' -t ARGV < <(tr '\n' '\0' < "${RUST_ARGS_FILE}") || true
 fi
 
-# If someone accidentally included /entrypoint.sh, strip it.
+# 2) Base64(JSON)
+if [[ "${#ARGV[@]}" -eq 0 && -n "${RUST_ARGS_B64:-}" ]]; then
+  json="$(printf '%s' "${RUST_ARGS_B64}" | base64 -d 2>/dev/null || true)"
+  if [[ -n "${json}" ]]; then
+    while IFS= read -r -d '' item; do ARGV+=("$item"); done < <(
+      node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8")); if(!Array.isArray(a))process.exit(1); for(const s of a){process.stdout.write(String(s)); process.stdout.write("\0");}}catch(e){process.exit(2)}' <<<"${json}" || true
+    )
+  fi
+fi
+
+# 3) JSON
+if [[ "${#ARGV[@]}" -eq 0 && -n "${RUST_ARGS_JSON:-}" ]]; then
+  while IFS= read -r -d '' item; do ARGV+=("$item"); done < <(
+    node -e 'try{const a=JSON.parse(require("fs").readFileSync(0,"utf8")); if(!Array.isArray(a))process.exit(1); for(const s of a){process.stdout.write(String(s)); process.stdout.write("\0");}}catch(e){process.exit(2)}' <<<"${RUST_ARGS_JSON}" || true
+  )
+fi
+
+# 4) Fallback: tokens from Start Command or STARTUP string
+if [[ "${#ARGV[@]}" -eq 0 ]]; then
+  if [[ "$#" -gt 0 ]]; then
+    ARGV=( "$@" )
+  else
+    if [[ -z "${STARTUP:-}" ]]; then
+      err "No startup provided: neither argv env nor Start Command args nor STARTUP env found."
+      exit 12
+    fi
+    # Expand panel variables {{VAR}} -> ${VAR}
+    EXPANDED="$(
+      eval "echo \"$(printf '%s' "${STARTUP}" | sed -e 's/{{/${/g' -e 's/}}/}/g')\""
+    )"
+    # Let the shell split into tokens (might split multi-word… we'll repair next)
+    eval "set -- ${EXPANDED}"
+    ARGV=( "$@" )
+  fi
+
+  # ---- REPAIR PASS: rejoin values for flags that commonly include spaces ----
+  # Add/adjust flags here as needed.
+  REJOIN_FLAGS=(
+    "-server.hostname"
+    "-server.description"
+    "-server.tags"
+    "-server.url"
+    "-rcon.password"
+    "-logfile"
+  )
+  is_flag() { [[ "$1" == -* ]]; }
+  needs_rejoin() {
+    local f="$1"
+    for x in "${REJOIN_FLAGS[@]}"; do [[ "$f" == "$x" ]] && return 0; done
+    return 0  # default: be generous and allow joining until next flag after 1+ words
+  }
+
+  repaired=()
+  i=0
+  while [[ $i -lt ${#ARGV[@]} ]]; do
+    tok="${ARGV[$i]}"
+    if is_flag "$tok"; then
+      repaired+=("$tok")
+      ((i++))
+      if [[ $i -lt ${#ARGV[@]} ]]; then
+        # Always take at least one value if present
+        val="${ARGV[$i]}"
+        ((i++))
+        if needs_rejoin "$tok"; then
+          # Slurp additional words until the next looks like a flag
+          while [[ $i -lt ${#ARGV[@]} && ! "${ARGV[$i]}" =~ ^-[-A-Za-z0-9_.]+$ ]]; do
+            val+=" ${ARGV[$i]}"
+            ((i++))
+          done
+        fi
+        repaired+=("$val")
+      fi
+    else
+      repaired+=("$tok")
+      ((i++))
+    fi
+  done
+  ARGV=( "${repaired[@]}" )
+fi
+
+# Strip accidental /entrypoint.sh leading token
 if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then
   ARGV=( "${ARGV[@]:1}" )
 fi
 
-# Ensure the Rust binary exists & is executable (ARGV[0] should be ./RustDedicated)
+# Ensure the Rust binary exists
 if [[ ! -f "./RustDedicated" ]]; then
   err "RustDedicated not found in $(pwd). Did app_update install to /home/container?"
-  err "Set VALIDATE=1 (or enable AUTO_UPDATE in your egg) and try again."
+  err "Set VALIDATE=1 and try again."
   exit 13
 fi
-if [[ ! -x "./RustDedicated" ]]; then
-  chmod +x ./RustDedicated || true
-fi
+[[ -x "./RustDedicated" ]] || chmod +x ./RustDedicated || true
 
 log "Launching via wrapper (argv-file mode)…"
 
-# pick wrapper path (either location is fine)
+# Locate wrapper
 WRAPPER="/wrapper.js"
 [[ -f "$WRAPPER" ]] || WRAPPER="/opt/cobalt/wrapper.js"
 if [[ ! -f "$WRAPPER" ]]; then
@@ -194,10 +262,7 @@ if [[ ! -f "$WRAPPER" ]]; then
   exit 14
 fi
 
-# -----------------------------------------------------------------------
-# Launch through the console-wrapper, writing argv to a NUL-separated file
-# and passing it with --argv-file (no shell re-parsing anywhere).
-# -----------------------------------------------------------------------
+# Write ARGV to a NUL-separated file and exec wrapper with it
 ARGS_FILE="$(mktemp -p /home/container args.XXXXXXXX.nul)"
 # shellcheck disable=SC2059
 printf '%s\0' "${ARGV[@]}" > "${ARGS_FILE}"

@@ -2,8 +2,8 @@
 
 // ============================================================================
 // Rust wrapper -- Console-first (NO RCON), argv-safe + logfile mirroring
-// - Accepts argv via --argv-file (NUL- or newline-separated), --argv-json,
-//   --argv-b64, or legacy --argv <args...>
+// - Accepts argv via --argv-file (NUL/newline), --argv-json, --argv-b64,
+//   or legacy --argv <args...>
 // - Spawns RustDedicated WITHOUT a shell (preserves multi-word args)
 // - Mirrors stdout/stderr to panel, writes raw to latest.log
 // - If -logfile is present, tails it and mirrors to panel too
@@ -15,20 +15,15 @@ const fs = require("fs");
 const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
 
 // rotate previous log
-try {
-  if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`);
-} catch {}
-try {
-  fs.writeFileSync(LATEST_LOG, "", { flag: "w" });
-} catch (e) {
+try { if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`); } catch {}
+try { fs.writeFileSync(LATEST_LOG, "", { flag: "w" }); } catch (e) {
   console.error(`[wrapper] ERROR: unable to open ${LATEST_LOG}: ${e.message}`);
 }
 
 const argv = process.argv.slice(2);
 
-// ---------- decode argv safely ----------
 function decodeArgv() {
-  // 1) JSON on the command line
+  // --argv-json
   let i = argv.indexOf("--argv-json");
   if (i !== -1 && argv[i + 1]) {
     try {
@@ -40,8 +35,7 @@ function decodeArgv() {
       process.exit(1);
     }
   }
-
-  // 2) Base64(JSON array) on the command line
+  // --argv-b64
   i = argv.indexOf("--argv-b64");
   if (i !== -1 && argv[i + 1]) {
     try {
@@ -54,27 +48,23 @@ function decodeArgv() {
       process.exit(1);
     }
   }
-
-  // 3) Read from a file (prefer NUL-separated; fallback to newline)
+  // --argv-file
   i = argv.indexOf("--argv-file");
   if (i !== -1 && argv[i + 1]) {
     try {
       const buf = fs.readFileSync(argv[i + 1]);
-      // Try NUL-separated first
       let parts = buf.toString("utf8").split("\0").filter(s => s.length > 0);
       if (parts.length <= 1) {
-        // Fallback to newline-separated
         parts = buf.toString("utf8").split(/\r?\n/).filter(s => s.length > 0);
       }
       if (parts.length === 0) throw new Error("empty");
       return parts.map(String);
     } catch (e) {
-      console.error(`[wrapper] ERROR: --argv-file must point to a readable file (NUL- or newline-separated): ${e.message || e}`);
+      console.error(`[wrapper] ERROR: --argv-file must be readable (NUL/newline-separated): ${e.message || e}`);
       process.exit(1);
     }
   }
-
-  // 4) Env var with JSON array (optional convenience)
+  // env JSON
   if (process.env.RUST_ARGS_JSON) {
     try {
       const arr = JSON.parse(process.env.RUST_ARGS_JSON);
@@ -85,11 +75,10 @@ function decodeArgv() {
       process.exit(1);
     }
   }
-
-  // 5) Legacy fallback: --argv (space-split by the shell; may break multi-word)
+  // legacy --argv
   const flagIndex = argv.indexOf("--argv");
   if (flagIndex === -1) {
-    console.error("[wrapper] ERROR: Missing argv source. Use --argv-file, --argv-json, --argv-b64, RUST_ARGS_JSON, or legacy --argv.");
+    console.error("[wrapper] ERROR: Missing argv source. Use --argv-file/--argv-json/--argv-b64 or RUST_ARGS_JSON (or legacy --argv).");
     process.exit(1);
   }
   const legacy = argv.slice(flagIndex + 1);
@@ -114,7 +103,7 @@ console.log(
   params.map(a => (/[^A-Za-z0-9_/.:-]/.test(a) ? `"${a}"` : a)).join(" ")
 );
 
-// Detect -logfile path (next token is the path)
+// Detect -logfile path
 let unityLogfile = null;
 for (let i = 0; i < params.length; i++) {
   if (params[i] === "-logfile" && i + 1 < params.length) {
@@ -123,7 +112,7 @@ for (let i = 0; i < params.length; i++) {
   }
 }
 
-// Spawn WITHOUT shell: exact argv preserved
+// Spawn WITHOUT shell
 const game = spawn(executable, params, {
   stdio: ["pipe", "pipe", "pipe"],
   cwd: "/home/container",
@@ -138,7 +127,7 @@ function mirror(chunk, isErr = false) {
 game.stdout.on("data", (d) => mirror(d, false));
 game.stderr.on("data", (d) => mirror(d, true));
 
-// If -logfile is set, tail it and mirror to the panel too
+// Mirror -logfile too
 let tailProc = null;
 if (unityLogfile) {
   try { fs.closeSync(fs.openSync(unityLogfile, "a")); } catch {}
@@ -150,7 +139,7 @@ if (unityLogfile) {
   tailProc.on("exit", (c) => console.log(`[wrapper] tail exited (${c}).`));
 }
 
-// Forward panel input → server stdin
+// Panel input → server stdin
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (txt) => {
   try { game.stdin.write(txt); } catch {}
