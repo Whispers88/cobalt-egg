@@ -1,74 +1,93 @@
 #!/usr/bin/env node
 
 // ============================================================================
-// Rust wrapper -- Console-first (NO RCON), argv-safe + logfile mirroring
+// Rust wrapper — Console-first (NO RCON), argv-safe + logfile mirroring
 // - Accepts argv via --argv-file (NUL/newline), --argv-json, --argv-b64,
 //   or legacy --argv <args...>
-// - Repairs split multi-word values in JS (handles -flags and +commands)
-// - Spawns RustDedicated WITHOUT a shell (preserves multi-word args)
-// - Mirrors stdout/stderr to panel, writes raw to latest.log
-// - If -logfile is present, tails it and mirrors to panel too
+// - Repairs split multi-word values (-flags and +commands)
+// - Pretty console: timestamps, source tags, soft colors (auto-disables if not TTY)
+// - Writes RAW server output to latest.log (no timestamps/colors)
+// - If -logfile is present, tails and mirrors it as well
 // ============================================================================
 
 const { spawn } = require("child_process");
 const fs = require("fs");
 
+// ----------------------- config -----------------------
 const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
+const PRETTY = (process.env.WRAPPER_PRETTY || "1") !== "0";  // set 0 to disable
+const TIME_FMT = process.env.WRAPPER_TS_FMT || "iso";        // "iso" or "hmss"
+const COLOR_OK = PRETTY && process.stdout.isTTY && !("NO_COLOR" in process.env);
 
-// rotate previous log
-try {
-  if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`);
-} catch {}
-try {
-  fs.writeFileSync(LATEST_LOG, "", { flag: "w" });
-} catch (e) {
-  console.error(`[wrapper] ERROR: unable to open ${LATEST_LOG}: ${e.message}`);
+// ----------------------- colors -----------------------
+const C = COLOR_OK
+  ? {
+      reset: "\x1b[0m",
+      dim: "\x1b[2m",
+      bold: "\x1b[1m",
+      fg: {
+        gray: "\x1b[90m",
+        red: "\x1b[31m",
+        green: "\x1b[32m",
+        yellow: "\x1b[33m",
+        blue: "\x1b[34m",
+        magenta: "\x1b[35m",
+        cyan: "\x1b[36m",
+        white: "\x1b[37m",
+      },
+    }
+  : {
+      reset: "",
+      dim: "",
+      bold: "",
+      fg: { gray: "", red: "", green: "", yellow: "", blue: "", magenta: "", cyan: "", white: "" },
+    };
+
+// ----------------------- time/format helpers -----------------------
+function ts() {
+  if (TIME_FMT === "hmss") {
+    const d = new Date();
+    const pad = (n, l = 2) => String(n).padStart(l, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+  // ISO with seconds.millis, but shorter than full
+  return new Date().toISOString().replace("T", " ").replace("Z", "");
+}
+function tag(label, color) {
+  return `${C.dim}[${color}${label}${C.reset}${C.dim}]${C.reset}`;
+}
+function linePrefix(label, color) {
+  return `${C.dim}${ts()}${C.reset} ${tag(label, color)}`;
+}
+function looksLikeFlag(s) {
+  return typeof s === "string" && /^[-+][A-Za-z0-9_.-]+$/.test(s);
 }
 
-// ----------------------- helpers -----------------------
-const looksLikeFlag = (s) => typeof s === "string" && /^[-+][A-Za-z0-9_.-]+$/.test(s);
-
-// Some switches take **no value**; keep them standalone.
+// Switch-only flags (consume no value)
 const SWITCH_ONLY = new Set([
   "-batchmode",
   "-nographics",
   "-nolog",
   "-no-gui",
-  // add more switch-only flags here if needed
 ]);
 
-/**
- * Repair split values:
- * Turns ["+server.hostname","A","Rust","Server","+server.level","Procedural","Map"]
- * into ["+server.hostname","A Rust Server","+server.level","Procedural Map"]
- *
- * Works for both -flags and +commands. Leaves non-flag tokens as-is.
- */
+// Repair split values in argv
 function repairSplitArgs(params) {
   const out = [];
   for (let i = 0; i < params.length; ) {
     const tok = String(params[i]);
     if (looksLikeFlag(tok)) {
-      // push the flag itself
       out.push(tok);
       i++;
-
-      // switch-only? no value consumed
       if (SWITCH_ONLY.has(tok)) continue;
-
-      // if there is at least one value, start with it
       if (i < params.length) {
-        let val = String(params[i]);
-        i++;
-        // slurp additional words until the next token looks like a flag
+        let val = String(params[i++]);
         while (i < params.length && !looksLikeFlag(params[i])) {
-          val += " " + String(params[i]);
-          i++;
+          val += " " + String(params[i++]);
         }
         out.push(val);
       }
     } else {
-      // not a flag: pass through (covers executable paths if they slip in here)
       out.push(tok);
       i++;
     }
@@ -76,11 +95,32 @@ function repairSplitArgs(params) {
   return out;
 }
 
-// ----------------------- argv decoding -----------------------
+// ----------------------- log setup -----------------------
+function wlog(msg, level = "info") {
+  const color = level === "error" ? C.fg.red : level === "warn" ? C.fg.yellow : C.fg.cyan;
+  const pfx = linePrefix("wrapper", color);
+  process.stdout.write(`${pfx} ${msg}\n`);
+}
+function werr(msg) {
+  const pfx = linePrefix("wrapper", C.fg.red);
+  process.stderr.write(`${pfx} ${msg}\n`);
+}
+
+// Rotate & open latest.log (RAW data only)
+try {
+  if (fs.existsSync(LATEST_LOG)) fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`);
+} catch {}
+try {
+  fs.writeFileSync(LATEST_LOG, "", { flag: "w" });
+} catch (e) {
+  werr(`ERROR: unable to open ${LATEST_LOG}: ${e.message}`);
+}
+
+// ----------------------- argv decode -----------------------
 const argv = process.argv.slice(2);
 
 function decodeArgv() {
-  // 1) --argv-json
+  // --argv-json
   let i = argv.indexOf("--argv-json");
   if (i !== -1 && argv[i + 1]) {
     try {
@@ -88,12 +128,11 @@ function decodeArgv() {
       if (!Array.isArray(arr) || arr.length === 0) throw new Error();
       return arr.map(String);
     } catch {
-      console.error("[wrapper] ERROR: --argv-json must be a JSON array of strings.");
+      werr("ERROR: --argv-json must be a JSON array of strings.");
       process.exit(1);
     }
   }
-
-  // 2) --argv-b64 (base64(JSON array))
+  // --argv-b64
   i = argv.indexOf("--argv-b64");
   if (i !== -1 && argv[i + 1]) {
     try {
@@ -102,12 +141,11 @@ function decodeArgv() {
       if (!Array.isArray(arr) || arr.length === 0) throw new Error();
       return arr.map(String);
     } catch {
-      console.error("[wrapper] ERROR: --argv-b64 must be base64 of a JSON array of strings.");
+      werr("ERROR: --argv-b64 must be base64 of a JSON array of strings.");
       process.exit(1);
     }
   }
-
-  // 3) --argv-file (NUL- or newline-separated)
+  // --argv-file
   i = argv.indexOf("--argv-file");
   if (i !== -1 && argv[i + 1]) {
     try {
@@ -119,36 +157,30 @@ function decodeArgv() {
       if (parts.length === 0) throw new Error("empty argv file");
       return parts.map(String);
     } catch (e) {
-      console.error(
-        `[wrapper] ERROR: --argv-file must be readable (NUL/newline-separated): ${e.message || e}`
-      );
+      werr(`ERROR: --argv-file must be readable (NUL/newline-separated): ${e.message || e}`);
       process.exit(1);
     }
   }
-
-  // 4) Env JSON (optional)
+  // env JSON
   if (process.env.RUST_ARGS_JSON) {
     try {
       const arr = JSON.parse(process.env.RUST_ARGS_JSON);
       if (!Array.isArray(arr) || arr.length === 0) throw new Error();
       return arr.map(String);
     } catch {
-      console.error("[wrapper] ERROR: RUST_ARGS_JSON must be a JSON array of strings.");
+      werr("ERROR: RUST_ARGS_JSON must be a JSON array of strings.");
       process.exit(1);
     }
   }
-
-  // 5) Legacy --argv (already split by the shell)
+  // legacy --argv
   const flagIndex = argv.indexOf("--argv");
   if (flagIndex === -1) {
-    console.error(
-      "[wrapper] ERROR: Missing argv source. Use --argv-file/--argv-json/--argv-b64, RUST_ARGS_JSON, or legacy --argv."
-    );
+    werr("ERROR: Missing argv source. Use --argv-file/--argv-json/--argv-b64, RUST_ARGS_JSON, or legacy --argv.");
     process.exit(1);
   }
   const legacy = argv.slice(flagIndex + 1);
   if (legacy.length === 0) {
-    console.error("[wrapper] ERROR: No arguments provided for RustDedicated.");
+    werr("ERROR: No arguments provided for RustDedicated.");
     process.exit(1);
   }
   return legacy.map(String);
@@ -157,17 +189,15 @@ function decodeArgv() {
 const fullArgv = decodeArgv();
 const executable = fullArgv[0];
 let params = fullArgv.slice(1);
-
-// **apply repair in JS** so split values like "Procedural" "Map" become "Procedural Map"
 params = repairSplitArgs(params);
 
 if (!executable) {
-  console.error("[wrapper] ERROR: First argv element must be the RustDedicated binary.");
+  werr("ERROR: First argv element must be the RustDedicated binary.");
   process.exit(1);
 }
 
-console.log(
-  `[wrapper] Executing: ${executable} ` +
+wlog(
+  `Executing: ${C.bold}${executable}${C.reset} ` +
     params.map((a) => (/[^A-Za-z0-9_/.:-]/.test(a) ? `"${a}"` : a)).join(" ")
 );
 
@@ -180,43 +210,59 @@ for (let i = 0; i < params.length; i++) {
   }
 }
 
+// ----------------------- pretty mirroring -----------------------
+const buffers = Object.create(null); // per-source line buffers
+
+function emitPretty(source, color, chunk, isErr = false) {
+  const key = source + (isErr ? ":err" : ":out");
+  const prev = buffers[key] || "";
+  const s = prev + chunk.toString();
+
+  // Write RAW to latest.log (no prettification)
+  try {
+    fs.appendFile(LATEST_LOG, chunk.toString().replace(/\r/g, ""), () => {});
+  } catch {}
+
+  const lines = s.split(/\r?\n/);
+  buffers[key] = lines.pop(); // keep trailing partial line
+
+  const pfx = linePrefix(source, color);
+  for (const ln of lines) {
+    const outLine = `${pfx} ${ln}`;
+    if (isErr) process.stderr.write(outLine + "\n");
+    else process.stdout.write(outLine + "\n");
+  }
+}
+
+const gameColorOut = C.fg.green;
+const gameColorErr = C.fg.red;
+const tailColor = C.fg.yellow;
+
 // Spawn WITHOUT shell: exact argv preserved
 const game = spawn(executable, params, {
   stdio: ["pipe", "pipe", "pipe"],
   cwd: "/home/container",
 });
 
-function mirror(chunk, isErr = false) {
-  const s = chunk.toString();
-  (isErr ? process.stderr : process.stdout).write(s);
-  fs.appendFile(LATEST_LOG, s.replace(/\r/g, ""), () => {});
-}
-
-game.stdout.on("data", (d) => mirror(d, false));
-game.stderr.on("data", (d) => mirror(d, true));
+game.stdout.on("data", (d) => emitPretty("game", gameColorOut, d, false));
+game.stderr.on("data", (d) => emitPretty("game", gameColorErr, d, true));
 
 // If -logfile is set, tail it and mirror to the panel too
 let tailProc = null;
 if (unityLogfile) {
-  try {
-    fs.closeSync(fs.openSync(unityLogfile, "a"));
-  } catch {}
-  console.log(`[wrapper] Mirroring -logfile: ${unityLogfile}`);
-  tailProc = spawn("tail", ["-n", "+1", "-F", unityLogfile], {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const tailMirror = (d) => mirror(d, false);
+  try { fs.closeSync(fs.openSync(unityLogfile, "a")); } catch {}
+  wlog(`Mirroring -logfile: ${unityLogfile}`);
+  tailProc = spawn("tail", ["-n", "+1", "-F", unityLogfile], { stdio: ["ignore", "pipe", "pipe"] });
+  const tailMirror = (d) => emitPretty("unity", tailColor, d, false);
   tailProc.stdout.on("data", tailMirror);
   tailProc.stderr.on("data", tailMirror);
-  tailProc.on("exit", (c) => console.log(`[wrapper] tail exited (${c}).`));
+  tailProc.on("exit", (c) => wlog(`tail exited (${c}).`));
 }
 
 // Forward panel input → server stdin
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (txt) => {
-  try {
-    game.stdin.write(txt);
-  } catch {}
+  try { game.stdin.write(txt); } catch {}
 });
 process.stdin.resume();
 
@@ -225,26 +271,30 @@ let exited = false;
 ["SIGTERM", "SIGINT"].forEach((sig) => {
   process.on(sig, () => {
     if (!exited) {
-      console.log(`[wrapper] ${sig} → stopping server...`);
-      try {
-        game.stdin.write("quit\n");
-      } catch {}
-      setTimeout(() => {
-        try {
-          game.kill("TERM");
-        } catch {}
-      }, 5000);
+      wlog(`${sig} → stopping server...`);
+      try { game.stdin.write("quit\n"); } catch {}
+      setTimeout(() => { try { game.kill("TERM"); } catch {} }, 5000);
     }
   });
 });
 
 game.on("exit", (code) => {
   exited = true;
-  if (tailProc && !tailProc.killed) {
-    try {
-      tailProc.kill("TERM");
-    } catch {}
+  if (tailProc && !tailProc.killed) { try { tailProc.kill("TERM"); } catch {} }
+  wlog(`Rust exited with code: ${code}`, code ? "warn" : "info");
+
+  // Flush any trailing partial lines so nothing is lost visually
+  for (const k of Object.keys(buffers)) {
+    const rem = buffers[k];
+    if (!rem) continue;
+    const [src, kind] = k.split(":");
+    const color = src === "game" ? (kind === "err" ? gameColorErr : gameColorOut) : tailColor;
+    const pfx = linePrefix(src, color);
+    const outLine = `${pfx} ${rem}`;
+    if (kind === "err") process.stderr.write(outLine + "\n");
+    else process.stdout.write(outLine + "\n");
+    buffers[k] = "";
   }
-  console.log(`[wrapper] Rust exited with code: ${code}`);
+
   process.exit(code ?? 0);
 });
