@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# Pterodactyl entrypoint (setup only, then pass args through)
+# Rust Dedicated Server entrypoint (no symlink), using /home/container
 # ------------------------------------------------------------
 
-# Use the mounted server volume most nodes provide
+# Run everything from the Wings-mounted server volume
 export HOME=/home/container
 cd /home/container
 
@@ -15,50 +15,85 @@ log() { echo -e "[entrypoint] $*"; }
 ulimit -n 65535 || true
 umask 002
 
-# SteamCMD dirs under /home/container
+# ------------------------------------------------------------
+# SteamCMD preflight for /home/container layout
+# Steam uses $HOME/Steam/...; we ensure dirs exist under /home/container
+# ------------------------------------------------------------
 mkdir -p \
   /home/container/Steam/package \
   /home/container/steamcmd \
   /home/container/steamapps \
   /home/container/.steam/sdk32 \
-  /home/container/.steam/sdk64 || true
+  /home/container/.steam/sdk64
 
-# Ensure writable (won’t hurt if already owned)
+# Ensure the unprivileged user can write to the mounted volume
 chown -R "$(id -u)":"$(id -g)" /home/container || true
 
-# Help SteamCMD keep its cache here
+# Hint SteamCMD to keep cache/tools here (optional but useful)
 export STEAMCMDDIR=/home/container/steamcmd
 
-# ---- Optional: validation / framework handling ----
+# ------------------------------------------------------------
+# Config / Environment
+# ------------------------------------------------------------
 CURL="curl -fSL --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 0"
+
 SRCDS_APPID="${SRCDS_APPID:-258550}"
+
 STEAM_USER="${STEAM_USER:-anonymous}"
 STEAM_PASS="${STEAM_PASS:-}"
 STEAM_AUTH="${STEAM_AUTH:-}"
-FRAMEWORK="${FRAMEWORK:-vanilla}"
-VALIDATE="${VALIDATE:-0}"          # default off so Panel fully controls behavior
-EXTRA_FLAGS="${EXTRA_FLAGS:-}"
-STEAM_BRANCH="${STEAM_BRANCH:-}"
-STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"
 
+FRAMEWORK="${FRAMEWORK:-vanilla}"          # vanilla | oxide | carbon* (carbon, carbon-edge, carbon-staging, etc.)
+FRAMEWORK_UPDATE="${FRAMEWORK_UPDATE:-1}"   # reserved, for compatibility
+VALIDATE="${VALIDATE:-1}"                   # 1 to validate (recommended)
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"              # extra args for +app_update
+STEAM_BRANCH="${STEAM_BRANCH:-}"            # branch name (optional)
+STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"  # branch password (optional)
+
+STARTUP="${STARTUP:-}"                      # Pterodactyl STARTUP string
+
+# Log file (lives on the mounted volume)
+export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
+
+# Optional public IP detection
+if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
+  APP_PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  export APP_PUBLIC_IP
+fi
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 have_oxide()  { [[ -d "/home/container/oxide" ]]; }
 have_carbon() { [[ -d "/home/container/carbon" ]]; }
 
-uninstall_oxide()  { have_oxide  && rm -rf /home/container/oxide || true; }
+uninstall_oxide() {
+  if have_oxide; then
+    log "Removing Oxide/uMod files…"
+    rm -rf /home/container/oxide || true
+  fi
+}
+
 uninstall_carbon() {
-  have_carbon && {
-    rm -f  /home/container/Carbon.targets /home/container/winhttp.dll || true
-    rm -rf /home/container/doorstop_config /home/container/carbon   || true
-  }
+  if have_carbon; then
+    log "Removing Carbon files…"
+    rm -f  /home/container/Carbon.targets || true
+    rm -rf /home/container/doorstop_config || true
+    rm -f  /home/container/winhttp.dll || true
+    rm -rf /home/container/carbon || true
+  fi
 }
 
 install_oxide() {
-  local tmp; tmp="$(mktemp -d)"
-  pushd "$tmp" >/dev/null
+  log "Installing uMod (Oxide)…"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  pushd "$tmpdir" >/dev/null
   $CURL -o oxide.zip "https://umod.org/games/rust/download?build=linux"
   unzip -o oxide.zip -d /home/container
   popd >/dev/null
-  rm -rf "$tmp"
+  rm -rf "$tmpdir"
+  log "Oxide install complete."
 }
 
 install_carbon() {
@@ -71,8 +106,14 @@ install_carbon() {
     carbon* )         channel="production" ;;
   esac
   [[ "${FRAMEWORK}" == *"-minimal" ]] && minimal="1"
+
+  log "Installing Carbon (channel=${channel}, minimal=${minimal})…"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  pushd "$tmpdir" >/dev/null
+
   if [[ "$minimal" == "1" ]]; then
-    case "$channel" in
+    case "${channel}" in
       production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.Minimal.tar.gz" ;;
       edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.Minimal.tar.gz" ;;
       staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.Minimal.tar.gz" ;;
@@ -80,7 +121,7 @@ install_carbon() {
       aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.Minimal.tar.gz" ;;
     esac
   else
-    case "$channel" in
+    case "${channel}" in
       production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.tar.gz" ;;
       edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.tar.gz" ;;
       staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.tar.gz" ;;
@@ -88,12 +129,25 @@ install_carbon() {
       aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.tar.gz" ;;
     esac
   fi
-  [[ -z "$url" ]] || { curl -fSL "$url" -o carbon.tar.gz && tar -xzf carbon.tar.gz -C /home/container && rm -f carbon.tar.gz; }
+
+  [[ -z "${url}" ]] && { log "ERROR: Could not map Carbon artifact from FRAMEWORK='${FRAMEWORK}'"; exit 10; }
+
+  $CURL "$url" -o carbon.tar.gz
+  if [[ -n "${CARBON_SHA256:-}" ]]; then
+    echo "${CARBON_SHA256}  carbon.tar.gz" | sha256sum -c -
+  fi
+
+  tar -xzf carbon.tar.gz -C /home/container
+  popd >/dev/null
+  rm -rf "$tmpdir"
+  log "Carbon install complete."
 }
 
 steamcmd_path() {
+  # Prefer SteamCMD on the mounted volume if present
   if [[ -x "/home/container/steamcmd/steamcmd.sh" ]]; then echo "/home/container/steamcmd/steamcmd.sh"; return; fi
   if [[ -x "/home/container/steamcmd.sh" ]]; then echo "/home/container/steamcmd.sh"; return; fi
+  # Common locations from cm2network images
   if [[ -x "/home/steam/steamcmd/steamcmd.sh" ]]; then echo "/home/steam/steamcmd/steamcmd.sh"; return; fi
   if command -v steamcmd >/dev/null 2>&1; then command -v steamcmd; return; fi
   if [[ -x "/usr/games/steamcmd" ]]; then echo "/usr/games/steamcmd"; return; fi
@@ -101,35 +155,61 @@ steamcmd_path() {
 }
 
 validate_now() {
-  [[ "${VALIDATE}" != "1" ]] && return
+  [[ "${VALIDATE}" != "1" ]] && { log "Skipping validation (VALIDATE=${VALIDATE})."; return; }
+
   local SCMD; SCMD="$(steamcmd_path)"
-  [[ -z "$SCMD" ]] && { log "ERROR: steamcmd not found"; exit 11; }
+  [[ -z "$SCMD" ]] && { log "ERROR: steamcmd not found!"; exit 11; }
+
   local BRANCH_FLAGS=""
   if [[ -n "$STEAM_BRANCH" ]]; then
     BRANCH_FLAGS="-beta ${STEAM_BRANCH}"
-    [[ -n "$STEAM_BRANCH_PASS" ]] && BRANCH_FLAGS+=" -betapassword ${STEAM_BRANCH_PASS}"
+    if [[ -n "$STEAM_BRANCH_PASS" ]]; then
+      BRANCH_FLAGS="${BRANCH_FLAGS} -betapassword ${STEAM_BRANCH_PASS}"
+    fi
   fi
-  log "Validating via SteamCMD…"
+
+  log "Validating game files via SteamCMD (user=${STEAM_USER})…"
   "$SCMD" +force_install_dir /home/container \
          +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
          +app_update "${SRCDS_APPID}" ${BRANCH_FLAGS} ${EXTRA_FLAGS} validate \
          +quit
+  log "Validation complete."
 }
 
-# Optional framework maintenance; you can fully control by Panel variables too
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 case "${FRAMEWORK}" in
-  vanilla) uninstall_oxide; uninstall_carbon ;;
-  oxide|uMod) uninstall_carbon; validate_now; install_oxide ;;
-  carbon*) uninstall_oxide; validate_now; install_carbon ;;
-  *) uninstall_oxide; uninstall_carbon ;;
+  vanilla)
+    uninstall_oxide
+    uninstall_carbon
+    ;;
+  oxide|uMod)
+    uninstall_carbon
+    validate_now
+    install_oxide
+    ;;
+  carbon*)
+    uninstall_oxide
+    validate_now
+    install_carbon
+    ;;
+  *)
+    log "Unknown FRAMEWORK='${FRAMEWORK}', defaulting to vanilla."
+    uninstall_oxide
+    uninstall_carbon
+    ;;
 esac
 
-# One more validation if requested
+# Ensure at least one validation if requested
 validate_now
 
-# ---- Don’t print the full command; just run the wrapper with all args ----
-export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
-echo "[entrypoint] Starting server…"  # safe, no args leaked
+# Require a startup command
+if [[ -z "${STARTUP}" ]]; then
+  log "ERROR: No STARTUP command provided."
+  exit 12
+fi
 
-# Forward **all** Start Command arguments to the wrapper; the wrapper runs them under bash
-exec env LATEST_LOG="${LATEST_LOG}" /opt/node/bin/node /opt/cobalt/wrapper.js "$@"
+log "Launching server via wrapper: ${STARTUP}"
+# Pass LATEST_LOG so wrapper writes inside the mounted volume
+exec env LATEST_LOG="${LATEST_LOG}" /opt/node/bin/node /opt/cobalt/wrapper.js "${STARTUP}"
