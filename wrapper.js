@@ -38,7 +38,7 @@ gameProcess.on("exit", (code) => {
   process.exit(code ?? 0);
 });
 
-// Handle stdin → RCON bridge (until connected)
+// Buffer console until RCON is ready
 function initialListener(data) {
   const command = data.toString().trim();
   console.log(`Console not ready yet, ignored: "${command}"`);
@@ -47,7 +47,7 @@ process.stdin.resume();
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", initialListener);
 
-// Handle container stop signals
+// Forward stop signals
 ["SIGINT", "SIGTERM"].forEach(sig => {
   process.on(sig, () => {
     console.log(`Received ${sig}, stopping server...`);
@@ -55,15 +55,14 @@ process.stdin.on("data", initialListener);
   });
 });
 
+// WebRCON backoff loop
 let waiting = true;
 let delay = 3000;
 const maxDelay = 15000;
 const jitter = () => Math.floor(Math.random() * 1000);
 const backoff = () => Math.min(delay = Math.floor(delay * 1.5), maxDelay) + jitter();
 
-function createPacket(command) {
-  return JSON.stringify({ Identifier: -1, Message: command, Name: "WebRcon" });
-}
+const createPacket = (command) => JSON.stringify({ Identifier: -1, Message: command, Name: "WebRcon" });
 
 (function poll() {
   const host = process.env.RCON_IP || "127.0.0.1";
@@ -75,7 +74,6 @@ function createPacket(command) {
   ws.on("open", () => {
     waiting = false;
     console.log("Connected to WebRCON.");
-
     ws.send(createPacket("status"));
 
     process.stdin.removeListener("data", initialListener);
