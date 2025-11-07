@@ -1,159 +1,228 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Pterodactyl Install Script for Rust (works with Node-based images expecting /home/container/wrapper.js)
+# Server files live at /mnt/server (mounted at /home/container at runtime)
+
 set -euo pipefail
-export HOME=/home/container
-cd /home/container
 
-log() { echo -e "[entrypoint] $*"; }
+SRCDS_APPID="258550"
 
-# Preflight
-ulimit -n 65535 || true
-umask 002
+log() { echo "[install] $*"; }
+fail() { echo "[install][ERROR] $*" >&2; exit 1; }
 
-CURL="curl -fSL --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 0"
-SRCDS_APPID="${SRCDS_APPID:-258550}"
+# ---------- ENV / Defaults ----------
+export HOME="/mnt/server"
 STEAM_USER="${STEAM_USER:-anonymous}"
 STEAM_PASS="${STEAM_PASS:-}"
 STEAM_AUTH="${STEAM_AUTH:-}"
-FRAMEWORK="${FRAMEWORK:-vanilla}"
-FRAMEWORK_UPDATE="${FRAMEWORK_UPDATE:-1}"
-VALIDATE="${VALIDATE:-1}"
-EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 STEAM_BRANCH="${STEAM_BRANCH:-}"
 STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"
-STARTUP="${STARTUP:-}"
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"
+VALIDATE="${VALIDATE:-0}"   # set to 1 to run Steam 'validate'
 
-# Optional public IP auto detect
-if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
-  APP_PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  export APP_PUBLIC_IP
+# ---------- Prep filesystem ----------
+log "Preparing folders..."
+mkdir -p /mnt/server \
+         /mnt/server/steamcmd \
+         /mnt/server/steamapps
+
+# ---------- Download SteamCMD ----------
+log "Downloading SteamCMD..."
+cd /tmp
+curl -sSLo steamcmd_linux.tar.gz --fail --retry 5 --retry-connrefused --retry-delay 2 \
+  "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+tar -xzf steamcmd_linux.tar.gz -C /mnt/server/steamcmd
+
+# Keep chown narrow (avoid touching entire /mnt)
+chown -R root:root /mnt/server/steamcmd || true
+
+cd /mnt/server/steamcmd
+
+# ---------- Build command flags ----------
+declare -a APP_UPDATE
+if [[ -n "$STEAM_BRANCH" ]]; then
+  APP_UPDATE=(+app_update "$SRCDS_APPID" -beta "$STEAM_BRANCH")
+  if [[ -n "$STEAM_BRANCH_PASS" ]]; then
+    APP_UPDATE+=(-betapassword "$STEAM_BRANCH_PASS")
+  fi
+else
+  APP_UPDATE=(+app_update "$SRCDS_APPID")
 fi
 
+# EXTRA_FLAGS split into an array
+read -r -a EXTRA_ARR <<< "${EXTRA_FLAGS}"
 
-########## Helper functions ##########
+VALIDATE_ARR=()
+if [[ "$VALIDATE" == "1" ]]; then
+  VALIDATE_ARR+=(validate)
+fi
 
-have_oxide()  { [[ -d "/home/container/oxide" ]]; }
-have_carbon() { [[ -d "/home/container/carbon" ]]; }
+# ---------- Run SteamCMD ----------
+if [[ "$STEAM_USER" == "anonymous" ]]; then
+  log "Using anonymous Steam user"
+else
+  log "Using provided Steam user: ${STEAM_USER}"
+fi
 
-uninstall_oxide() {
-  if have_oxide; then
-    log "Removing Oxide (validation will restore vanilla files)…"
-    rm -rf /home/container/oxide || true
-  fi
+log "Running SteamCMD to install app ${SRCDS_APPID}..."
+./steamcmd.sh \
+  +force_install_dir "/mnt/server" \
+  +login "$STEAM_USER" "$STEAM_PASS" "$STEAM_AUTH" \
+  "${APP_UPDATE[@]}" "${EXTRA_ARR[@]}" "${VALIDATE_ARR[@]}" \
+  +quit
+
+# ---------- Copy steamclient .so ----------
+log "Installing steamclient libraries..."
+mkdir -p "/mnt/server/.steam/sdk32" "/mnt/server/.steam/sdk64"
+if [[ -f "linux32/steamclient.so" ]]; then
+  cp -v "linux32/steamclient.so" "/mnt/server/.steam/sdk32/steamclient.so"
+else
+  echo "[install][WARN] linux32/steamclient.so not found"
+fi
+if [[ -f "linux64/steamclient.so" ]]; then
+  cp -v "linux64/steamclient.so" "/mnt/server/.steam/sdk64/steamclient.so"
+else
+  echo "[install][WARN] linux64/steamclient.so not found"
+fi
+
+# ---------- Node wrapper (required by your image) ----------
+# Your image launches Node and expects /home/container/wrapper.js.
+# We generate a small wrapper that expands {{TOKENS}} -> env and runs the final command via bash.
+log "Writing wrapper.js for Node entrypoint..."
+cat > /mnt/server/wrapper.js <<'JS'
+const { spawn } = require('child_process');
+
+function expandTokens(input) {
+  // Replace {{VAR}} with the value from environment (falls back to empty string)
+  return input.replace(/{{(\w+)}}/g, (_, k) => process.env[k] ?? '');
 }
 
-uninstall_carbon() {
-  if have_carbon; then
-    log "Removing Carbon files…"
-    rm -f  /home/container/Carbon.targets || true
-    rm -rf /home/container/doorstop_config || true
-    rm -f  /home/container/winhttp.dll || true
-    rm -rf /home/container/carbon || true
-  fi
+const raw = process.env.STARTUP && process.env.STARTUP.trim().length
+  ? process.env.STARTUP
+  : (process.argv.length > 2 ? process.argv.slice(2).join(' ') : '');
+
+if (!raw) {
+  console.error('[wrapper] No startup command provided via STARTUP env or argv.');
+  process.exit(2);
 }
 
-install_oxide() {
-  log "Installing uMod (Oxide)…"
-  tmpdir="$(mktemp -d)"
-  pushd "$tmpdir" >/dev/null
-  $CURL -o oxide.zip "https://umod.org/games/rust/download?build=linux"
-  unzip -o oxide.zip -d /home/container
-  popd >/dev/null
-  rm -rf "$tmpdir"
-  log "Oxide install complete."
+const cmd = expandTokens(raw);
+console.log('[wrapper] Executing:', cmd);
+
+const child = spawn('/bin/bash', ['-lc', cmd], {
+  stdio: 'inherit',
+  env: process.env,
+});
+
+child.on('exit', (code, signal) => {
+  if (signal) {
+    console.error(`[wrapper] exited via signal ${signal}`);
+    process.exit(128);
+  }
+  process.exit(code ?? 0);
+});
+JS
+chmod +x /mnt/server/wrapper.js
+
+# ---------- tools/wipe.sh (safe & portable) ----------
+log "Installing tools/wipe.sh..."
+mkdir -p /mnt/server/tools
+cat > /mnt/server/tools/wipe.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<USAGE
+Usage: wipe.sh [map|blueprints|full] [--dry-run]
+Default: map
+
+Environment:
+  SERVER_IDENTITY   Server identity name (default: rust)
+  PRESERVE_DIRS     Comma-separated list of top-level items to keep during full wipe
+                    (default: oxide,carbon,cfg,Configs,plugins,Carbon,oxide.config.json)
+USAGE
 }
 
-install_carbon() {
-  local channel="production" minimal="0" url=""
+IDENTITY="${SERVER_IDENTITY:-rust}"
+ROOT="/mnt/server/server/${IDENTITY}"
+TYPE="${1:-map}"
+DRYRUN=0
+[[ "${2:-}" == "--dry-run" ]] && DRYRUN=1
 
-  case "${FRAMEWORK}" in
-    carbon-edge* )    channel="edge" ;;
-    carbon-staging* ) channel="staging" ;;
-    carbon-aux1* )    channel="aux1" ;;
-    carbon-aux2* )    channel="aux2" ;;
-    carbon* )         channel="production" ;;
-  esac
+log(){ echo "[wipe] $*"; }
 
-  [[ "${FRAMEWORK}" == *"-minimal" ]] && minimal="1"
+if [[ ! -d "$ROOT" ]]; then
+  echo "[wipe] ERROR: server identity dir not found: $ROOT" >&2
+  exit 1
+fi
 
-  log "Installing Carbon (channel=${channel}, minimal=${minimal})…"
-  tmpdir="$(mktemp -d)"
-  pushd "$tmpdir" >/dev/null
+PRESERVE="${PRESERVE_DIRS:-oxide,carbon,cfg,Configs,plugins,Carbon,oxide.config.json}"
+IFS=',' read -r -a PRES <<< "$PRESERVE"
 
-  if [[ "$minimal" == "1" ]]; then
-    case "${channel}" in
-      production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.Minimal.tar.gz" ;;
-      edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.Minimal.tar.gz" ;;
-      staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.Minimal.tar.gz" ;;
-      aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1.Minimal.tar.gz" ;;
-      aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.Minimal.tar.gz" ;;
-    esac
+should_preserve() {
+  local base="$1"
+  for d in "${PRES[@]}"; do
+    [[ "$base" == "$d" ]] && return 0
+  done
+  return 1
+}
+
+rm_portable() {
+  # BusyBox rm lacks --one-file-system; test and use if available
+  if rm --help 2>&1 | grep -q -- '--one-file-system'; then
+    rm -rf --one-file-system "$@"
   else
-    case "${channel}" in
-      production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.tar.gz" ;;
-      edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.tar.gz" ;;
-      staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging.tar.gz" ;;
-      aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1.tar.gz" ;;
-      aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2.tar.gz" ;;
-    esac
+    rm -rf "$@"
   fi
-
-  $CURL "$url" -o carbon.tar.gz
-  tar -xzf carbon.tar.gz -C /home/container
-  popd >/dev/null
-  rm -rf "$tmpdir"
-  log "Carbon install complete."
 }
 
-steamcmd_path() {
-  if [[ -x "/home/container/steamcmd/steamcmd.sh" ]]; then echo "/home/container/steamcmd/steamcmd.sh"; return; fi
-  if [[ -x "/home/container/steamcmd.sh" ]]; then echo "/home/container/steamcmd.sh"; return; fi
-  if [[ -x "/home/steam/steamcmd/steamcmd.sh" ]]; then echo "/home/steam/steamcmd/steamcmd.sh"; return; fi
-  if command -v steamcmd >/dev/null 2>&1; then command -v steamcmd; return; fi
-  echo ""
+delete_path() {
+  local p="$1"
+  if (( DRYRUN )); then
+    log "DRY-RUN delete $p"
+  else
+    rm_portable "$p"
+  fi
 }
 
-validate_now() {
-  [[ "$VALIDATE" != "1" ]] && return
+log "Starting wipe: type=$TYPE on $ROOT (preserve: ${PRESERVE})"
 
-  local SCMD; SCMD="$(steamcmd_path)"
-  [[ -z "$SCMD" ]] && { log "steamcmd not found!"; exit 11; }
-
-  log "Validating via steamcmd…"
-  "$SCMD" +force_install_dir /home/container \
-         +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
-         +app_update "${SRCDS_APPID}" validate \
-         +quit
-  log "Validation complete."
-}
-
-
-########## MAIN ##########
-
-case "${FRAMEWORK}" in
-  vanilla)
-    uninstall_oxide
-    uninstall_carbon
+case "$TYPE" in
+  map )
+    if (( DRYRUN )); then
+      find "$ROOT" -maxdepth 1 -type f \( -name '*.map' -o -name '*.sav' \) -print
+    else
+      find "$ROOT" -maxdepth 1 -type f \( -name '*.map' -o -name '*.sav' \) -print -delete
+    fi
     ;;
-  oxide|uMod)
-    uninstall_carbon
-    validate_now
-    install_oxide
+  blueprints )
+    if (( DRYRUN )); then
+      find "$ROOT" -maxdepth 1 -type f -name 'blueprints.*.db' -print
+    else
+      find "$ROOT" -maxdepth 1 -type f -name 'blueprints.*.db' -print -delete
+    fi
     ;;
-  carbon*)
-    uninstall_oxide
-    validate_now
-    install_carbon
+  full )
+    shopt -s nullglob
+    for f in "$ROOT"/*; do
+      base="$(basename "$f")"
+      if should_preserve "$base"; then
+        log "preserve $base"
+        continue
+      fi
+      log "delete $base"
+      delete_path "$f"
+    done
+    mkdir -p "$ROOT/cfg"
     ;;
-  *)
-    log "Unknown framework '${FRAMEWORK}', defaulting to vanilla."
-    uninstall_oxide
-    uninstall_carbon
+  * )
+    echo "[wipe] ERROR: unknown wipe type: $TYPE" >&2
+    usage
+    exit 2
     ;;
 esac
 
-validate_now
+log "Wipe complete."
+EOF
+chmod +x /mnt/server/tools/wipe.sh
 
-[[ -z "${STARTUP}" ]] && { log "ERROR: No STARTUP command provided."; exit 12; }
-
-log "Launching server with wrapper: ${STARTUP}"
-exec /opt/node/bin/node /home/container/wrapper.js "${STARTUP}"
+log "Installation complete."
