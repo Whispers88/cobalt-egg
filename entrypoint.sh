@@ -2,101 +2,102 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# Pterodactyl Rust entrypoint — panel-driven startup expansion
+# Rust Dedicated Server entrypoint (no symlink), using /home/container
 # ------------------------------------------------------------
 
+export HOME=/home/container
 cd /home/container
 
-# Make internal Docker IP available to processes (like stock yolks)
-export INTERNAL_IP="$(ip route get 1 | awk '{print $(NF-2); exit}')"
+# --- helpers ---
+log()     { echo -e "[entrypoint] $*"; }
+Debug()   { [[ "${DEBUG:-0}" == "1" ]] && echo -e "[debug] $*"; }
+Success() { echo -e "[  OK  ] $*"; }
+Warn()    { echo -e "[warn]  $*"; }
+Err()     { echo -e "[error] $*" >&2; }
 
-# Defaults (panel can override with Egg variables)
-: "${SRCDS_APPID:=258550}"
-: "${STEAM_USER:=anonymous}"
-: "${STEAM_PASS:=}"
-: "${STEAM_AUTH:=}"
-: "${AUTO_UPDATE:=1}"
-: "${FRAMEWORK:=vanilla}"     # vanilla | oxide | carbon* (carbon, carbon-edge, ...)
-: "${UPDATE_CARBON:=0}"       # legacy toggle; treated equivalent to FRAMEWORK=carbon
-: "${OXIDE:=0}"               # legacy toggle; treated equivalent to FRAMEWORK=oxide
-: "${EXTRA_FLAGS:=}"          # extra flags for +app_update
-: "${STEAM_BRANCH:=}"         # optional beta branch
-: "${STEAM_BRANCH_PASS:=}"    # optional branch password
+# Niceties
+ulimit -n 65535 || true
+umask 002
 
-# Where SteamCMD caches live under /home/container
-export STEAMCMDDIR="/home/container/steamcmd"
-
-# Ensure directories exist & are writable on the mounted volume
+# ------------------------------------------------------------
+# SteamCMD preflight for /home/container layout
+# ------------------------------------------------------------
 mkdir -p \
   /home/container/Steam/package \
   /home/container/steamcmd \
   /home/container/steamapps \
   /home/container/.steam/sdk32 \
-  /home/container/.steam/sdk64 || true
+  /home/container/.steam/sdk64
+
 chown -R "$(id -u)":"$(id -g)" /home/container || true
+export STEAMCMDDIR=/home/container/steamcmd
 
 # ------------------------------------------------------------
-# Helper: find steamcmd
-# ------------------------------------------------------------
-steamcmd_path() {
-  if [[ -x "/home/container/steamcmd/steamcmd.sh" ]]; then echo "/home/container/steamcmd/steamcmd.sh"; return; fi
-  if [[ -x "/home/container/steamcmd.sh" ]]; then echo "/home/container/steamcmd.sh"; return; fi
-  if [[ -x "/home/steam/steamcmd/steamcmd.sh" ]]; then echo "/home/steam/steamcmd/steamcmd.sh"; return; fi
-  if command -v steamcmd >/dev/null 2>&1; then command -v steamcmd; return; fi
-  if [[ -x "/usr/games/steamcmd" ]]; then echo "/usr/games/steamcmd"; return; fi
-  echo ""
-}
-
-# ------------------------------------------------------------
-# Auto update via SteamCMD (like stock yolks)
-# ------------------------------------------------------------
-if [[ -z "${AUTO_UPDATE}" || "${AUTO_UPDATE}" == "1" ]]; then
-  SCMD="$(steamcmd_path)"
-  if [[ -z "${SCMD}" ]]; then
-    echo "ERROR: steamcmd not found; cannot update. (Check base image/egg.)"
-    exit 11
-  fi
-
-  BRANCH_FLAGS=""
-  if [[ -n "${STEAM_BRANCH}" ]]; then
-    BRANCH_FLAGS="-beta ${STEAM_BRANCH}"
-    if [[ -n "${STEAM_BRANCH_PASS}" ]]; then
-      BRANCH_FLAGS="${BRANCH_FLAGS} -betapassword ${STEAM_BRANCH_PASS}"
-    fi
-  fi
-
-  # Login tuple: allow anonymous or credentials + authcode if provided
-  echo "Updating Rust Dedicated Server (appid=${SRCDS_APPID})..."
-  "${SCMD}" +force_install_dir /home/container \
-           +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
-           +app_update "${SRCDS_APPID}" ${BRANCH_FLAGS} ${EXTRA_FLAGS} \
-           +quit
-else
-  echo "AUTO_UPDATE=0 — skipping game update."
-fi
-
-# ------------------------------------------------------------
-# Expand Panel Start Command ({{VAR}} -> ${VAR} + eval echo)
-# This lets Wings do the templating and we resolve envs here, too.
-# ------------------------------------------------------------
-if [[ -z "${STARTUP:-}" ]]; then
-  echo "ERROR: STARTUP not provided by Panel."
-  exit 12
-fi
-
-# Convert {{VAR}} → ${VAR} then expand using the current environment
-MODIFIED_STARTUP="$(eval echo "$(echo "${STARTUP}" | sed -e 's/{{/${/g' -e 's/}}/}/g')")"
-
-# Show the command like stock yolks do (comment out to hide)
-echo ":/home/container$ ${MODIFIED_STARTUP}"
-
-# ------------------------------------------------------------
-# Framework handling (Carbon/Oxide) — mirrors the style you posted
+# Config / Environment
 # ------------------------------------------------------------
 CURL="curl -fSL --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 0"
 
+SRCDS_APPID="${SRCDS_APPID:-258550}"
+STEAM_USER="${STEAM_USER:-anonymous}"
+STEAM_PASS="${STEAM_PASS:-}"
+STEAM_AUTH="${STEAM_AUTH:-}"
+
+FRAMEWORK="${FRAMEWORK:-vanilla}"          # vanilla | oxide | carbon* (carbon, carbon-edge, carbon-staging, etc.)
+FRAMEWORK_UPDATE="${FRAMEWORK_UPDATE:-1}"   # reserved, for compatibility
+VALIDATE="${VALIDATE:-1}"                   # 1 to validate (recommended)
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"              # extra args for +app_update
+STEAM_BRANCH="${STEAM_BRANCH:-}"            # branch name (optional)
+STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"  # branch password (optional)
+
+STARTUP="${STARTUP:-}"                      # Pterodactyl STARTUP string from the panel
+
+# Logging
+export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
+DEBUG="${DEBUG:-0}"                         # set DEBUG=1 to print expanded command
+MASK_SECRETS="${MASK_SECRETS:-1}"           # mask obvious secrets in debug echo
+
+# Optional public IP detection
+if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
+  APP_PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  export APP_PUBLIC_IP
+fi
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+have_oxide()  { [[ -d "/home/container/oxide" ]]; }
+have_carbon() { [[ -d "/home/container/carbon" ]]; }
+
+uninstall_oxide() {
+  if have_oxide; then
+    log "Removing Oxide/uMod files…"
+    rm -rf /home/container/oxide || true
+  fi
+}
+
+uninstall_carbon() {
+  if have_carbon; then
+    log "Removing Carbon files…"
+    rm -f  /home/container/Carbon.targets || true
+    rm -rf /home/container/doorstop_config || true
+    rm -f  /home/container/winhttp.dll || true
+    rm -rf /home/container/carbon || true
+  fi
+}
+
+install_oxide() {
+  log "Installing uMod (Oxide)…"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  pushd "$tmpdir" >/dev/null
+  $CURL -o oxide.zip "https://umod.org/games/rust/download?build=linux"
+  unzip -o oxide.zip -d /home/container
+  popd >/dev/null
+  rm -rf "$tmpdir"
+  log "Oxide install complete."
+}
+
 install_carbon() {
-  # Choose channel from FRAMEWORK: carbon, carbon-edge, carbon-staging, carbon-aux1, carbon-aux2
   local channel="production" minimal="0" url=""
   case "${FRAMEWORK}" in
     carbon-edge* )    channel="edge" ;;
@@ -107,7 +108,11 @@ install_carbon() {
   esac
   [[ "${FRAMEWORK}" == *"-minimal" ]] && minimal="1"
 
-  echo "Updating Carbon (channel=${channel}, minimal=${minimal})..."
+  log "Installing Carbon (channel=${channel}, minimal=${minimal})…"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  pushd "$tmpdir" >/dev/null
+
   if [[ "$minimal" == "1" ]]; then
     case "${channel}" in
       production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.Minimal.tar.gz" ;;
@@ -126,57 +131,107 @@ install_carbon() {
     esac
   fi
 
-  if [[ -n "${url}" ]]; then
-    TMP="$(mktemp -d)"
-    pushd "$TMP" >/dev/null
-    ${CURL} "${url}" -o carbon.tar.gz
-    tar -xzf carbon.tar.gz -C /home/container
-    popd >/dev/null
-    rm -rf "$TMP"
-    echo "Carbon updated."
-    # Enable Doorstop for Carbon (like your sample)
-    export DOORSTOP_ENABLED=1
-    export DOORSTOP_TARGET_ASSEMBLY="$(pwd)/carbon/managed/Carbon.Preloader.dll"
-    MODIFIED_STARTUP="LD_PRELOAD=$(pwd)/libdoorstop.so ${MODIFIED_STARTUP}"
-  else
-    echo "WARN: Could not determine Carbon URL for FRAMEWORK='${FRAMEWORK}'"
+  [[ -z "${url}" ]] && { log "ERROR: Could not map Carbon artifact from FRAMEWORK='${FRAMEWORK}'"; exit 10; }
+
+  $CURL "$url" -o carbon.tar.gz
+  if [[ -n "${CARBON_SHA256:-}" ]]; then
+    echo "${CARBON_SHA256}  carbon.tar.gz" | sha256sum -c -
   fi
-}
 
-install_oxide() {
-  echo "Updating uMod (Oxide)…"
-  TMP="$(mktemp -d)"
-  pushd "$TMP" >/dev/null
-  # Generic "latest linux" URL maintained by uMod
-  ${CURL} -o oxide.zip "https://umod.org/games/rust/download?build=linux"
-  unzip -o -q oxide.zip -d /home/container
-  # Optional: compiler (as in your sample)
-  ${CURL} -o /home/container/Compiler.x86_x64 "https://assets.umod.org/compiler/Compiler.x86_x64" || true
+  tar -xzf carbon.tar.gz -C /home/container
   popd >/dev/null
-  rm -rf "$TMP"
-  echo "uMod updated."
+  rm -rf "$tmpdir"
+  log "Carbon install complete."
 }
 
-# Decide framework action
-if [[ "${FRAMEWORK}" == "carbon" || "${UPDATE_CARBON:-0}" == "1" || "${FRAMEWORK}" == carbon* ]]; then
-  install_carbon
-elif [[ "${OXIDE:-0}" == "1" || "${FRAMEWORK}" == "oxide" ]]; then
-  install_oxide
-# else vanilla → do nothing
+steamcmd_path() {
+  if [[ -x "/home/container/steamcmd/steamcmd.sh" ]]; then echo "/home/container/steamcmd/steamcmd.sh"; return; fi
+  if [[ -x "/home/container/steamcmd.sh" ]]; then echo "/home/container/steamcmd.sh"; return; fi
+  if [[ -x "/home/steam/steamcmd/steamcmd.sh" ]]; then echo "/home/steam/steamcmd/steamcmd.sh"; return; fi
+  if command -v steamcmd >/dev/null 2>&1; then command -v steamcmd; return; fi
+  if [[ -x "/usr/games/steamcmd" ]]; then echo "/usr/games/steamcmd"; return; fi
+  echo ""
+}
+
+validate_now() {
+  [[ "${VALIDATE}" != "1" ]] && { log "Skipping validation (VALIDATE=${VALIDATE})."; return; }
+
+  local SCMD; SCMD="$(steamcmd_path)"
+  [[ -z "$SCMD" ]] && { log "ERROR: steamcmd not found!"; exit 11; }
+
+  local BRANCH_FLAGS=""
+  if [[ -n "$STEAM_BRANCH" ]]; then
+    BRANCH_FLAGS="-beta ${STEAM_BRANCH}"
+    if [[ -n "$STEAM_BRANCH_PASS" ]]; then
+      BRANCH_FLAGS="${BRANCH_FLAGS} -betapassword ${STEAM_BRANCH_PASS}"
+    fi
+  fi
+
+  log "Validating game files via SteamCMD (user=${STEAM_USER})…"
+  "$SCMD" +force_install_dir /home/container \
+         +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
+         +app_update "${SRCDS_APPID}" ${BRANCH_FLAGS} ${EXTRA_FLAGS} validate \
+         +quit
+  log "Validation complete."
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+case "${FRAMEWORK}" in
+  vanilla)
+    uninstall_oxide
+    uninstall_carbon
+    ;;
+  oxide|uMod)
+    uninstall_carbon
+    validate_now
+    install_oxide
+    ;;
+  carbon*)
+    uninstall_oxide
+    validate_now
+    install_carbon
+    ;;
+  *)
+    log "Unknown FRAMEWORK='${FRAMEWORK}', defaulting to vanilla."
+    uninstall_oxide
+    uninstall_carbon
+    ;;
+esac
+
+# Ensure at least one validation if requested
+validate_now
+
+# ------------------------------------------------------------
+# Expand Panel STARTUP: {{VAR}} -> ${VAR} then eval echo
+# ------------------------------------------------------------
+if [[ -z "${STARTUP}" ]]; then
+  Err "No STARTUP command provided by panel."
+  exit 12
 fi
 
-# ------------------------------------------------------------
-# Runtime library path fix (as in your sample)
-# ------------------------------------------------------------
-export LD_LIBRARY_PATH="$(pwd)/RustDedicated_Data/Plugins/x86_64:$(pwd)"
+# Convert braces and expand with current environment.
+# The printf layer protects existing quotes inside STARTUP.
+MODIFIED_STARTUP="$(
+  eval "echo \"$(printf '%s' "${STARTUP}" | sed -e 's/{{/${/g' -e 's/}}/}/g')\""
+)"
+
+# Optional debug print (like yolks). Mask obvious secrets by default.
+if [[ "${DEBUG}" == "1" ]]; then
+  TO_SHOW="${MODIFIED_STARTUP}"
+  if [[ "${MASK_SECRETS}" == "1" ]]; then
+    # Mask +rcon.password "..." and -logfile "..."
+    TO_SHOW="$(echo "${TO_SHOW}" \
+      | sed -E 's/(\+rcon\.password\s+)"[^"]*"/\1"******"/g' \
+      | sed -E 's/(-logfile\s+)"[^"]*"/\1"******"/g')"
+  fi
+  Debug ":/home/container$ ${TO_SHOW}"
+fi
+Success "Variables replaced!"
 
 # ------------------------------------------------------------
-# Find wrapper (support either layout)
+# Launch via wrapper with expanded command
+# (wrapper will run it under bash so [[ ]] / == / $() works)
 # ------------------------------------------------------------
-WRAPPER="/opt/cobalt/wrapper.js"
-[[ -f "/wrapper.js" ]] && WRAPPER="/wrapper.js"
-
-# ------------------------------------------------------------
-# Run the Server via Node wrapper (which will use bash)
-# ------------------------------------------------------------
-exec /opt/node/bin/node "${WRAPPER}" "${MODIFIED_STARTUP}"
+exec env LATEST_LOG="${LATEST_LOG}" /opt/node/bin/node /opt/cobalt/wrapper.js "${MODIFIED_STARTUP}"
