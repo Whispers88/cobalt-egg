@@ -14,7 +14,7 @@ good() { echo -e "${GRN}[ok]${NC} $*"; }
 # niceties
 ulimit -n 65535 || true
 umask 002
-chown -R "$(id -u):"$(id -g) /home/container 2>/dev/null || true
+chown -R "$(id -u):$(id -g)" /home/container 2>/dev/null || true
 
 # SteamCMD layout
 mkdir -p /home/container/Steam/package /home/container/steamcmd /home/container/.steam/sdk32 /home/container/.steam/sdk64
@@ -87,9 +87,9 @@ NEXT_WORLD_SIZE="${NEXT_WORLD_SIZE:-}"
 NEXT_WORLD_SEED="${NEXT_WORLD_SEED:-}"
 NEXT_OVERRIDES_FILE="/home/container/.next_world.env"
 
-# Crash bundles
+# Crash bundles (safe default path; never crash on failure)
 CRASH_ARCHIVE="${CRASH_ARCHIVE:-1}"
-CRASH_PATH="${CRASH_PATH:-/crashdumps}"
+CRASH_PATH="${CRASH_PATH:-/home/container/crashdumps}"
 
 # Preflight port checks
 PREFLIGHT_PORTCHECK="${PREFLIGHT_PORTCHECK:-1}"
@@ -210,9 +210,9 @@ match_cron_field() {
   IFS=',' read -ra parts <<< "$field"
   for p in "${parts[@]}"; do
     if [[ "$p" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-      [[ "$val" -ge "${BASH_REMATCH[1]}" && "$val" -le "${BASH_REMATCH[2]}" ]] && return 0
+      [[ "$val" -ge "${BASHREMATCH[1]}" && "$val" -le "${BASHREMATCH[2]}" ]] && return 0
     elif [[ "$p" =~ ^\*/([0-9]+)$ ]]; then
-      (( val % ${BASH_REMATCH[1]} == 0 )) && return 0
+      (( val % ${BASHREMATCH[1]} == 0 )) && return 0
     elif [[ "$p" =~ ^[0-9]+$ ]]; then
       [[ "$val" -eq "$p" ]] && return 0
     fi
@@ -360,41 +360,46 @@ fi
 # If someone accidentally included /entrypoint.sh, strip it.
 if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then ARGV=( "${ARGV[@]:1}" ); fi
 
-# --- sanitize ARGV: drop flags with empty values; ensure Unity flags first ---
+# --- sanitize ARGV SAFELY: keep exe at index 0; clean & reorder only arguments ---
+exe="${ARGV[0]}"
+args=( "${ARGV[@]:1}" )
+
+# Drop empty-valued pairs (+server.levelurl "", etc.) in args[]
 rebuild=()
 i=0
-while (( i < ${#ARGV[@]} )); do
-  k="${ARGV[i]}"
-  v=""
-  if (( i+1 < ${#ARGV[@]} )); then v="${ARGV[i+1]}"; fi
+while (( i < ${#args[@]} )); do
+  k="${args[i]}"
+  v=""; hasv=0
+  if [[ "$k" == +* ]] && (( i+1 < ${#args[@]} )); then v="${args[i+1]}"; hasv=1; fi
 
   case "$k" in
-    # If these have empty values ("" or all quotes), drop the pair entirely
     +server.levelurl|+server.headerimage|+server.logoimage|+server.url|+server.tags|+gamemode|+server.description)
-      if [[ -z "${v//\"/}" ]]; then i=$((i+2)); continue; fi
+      if (( hasv )) && [[ -z "${v//\"/}" ]]; then i=$((i+2)); continue; fi
       ;;
   esac
 
   rebuild+=( "$k" )
-  if [[ "$k" == +* ]] && (( i+1 < ${#ARGV[@]} )); then
-    rebuild+=( "$v" ); i=$((i+2)); continue
-  fi
-  i=$((i+1))
+  if (( hasv )); then rebuild+=( "$v" ); i=$((i+2)); else i=$((i+1)); fi
 done
-ARGV=( "${rebuild[@]}" )
 
-# Unity flags front; add -nographics if missing
+# Unity flags to the front of *argument* list only; ensure -batchmode/-nographics exist
 front=(); rest=()
-for tok in "${ARGV[@]}"; do
+for tok in "${rebuild[@]}"; do
   case "$tok" in
     -batchmode|-nographics) front+=( "$tok" ) ;;
-    *) rest+=( "$tok" ) ;;
+    *)                      rest+=( "$tok" ) ;;
   esac
 done
-need_nograph=1
-for t in "${front[@]}" "${rest[@]}"; do [[ "$t" == "-nographics" ]] && need_nograph=0; done
+need_batch=1; need_nograph=1
+for t in "${front[@]}"; do
+  [[ "$t" == "-batchmode"   ]] && need_batch=0
+  [[ "$t" == "-nographics" ]] && need_nograph=0
+done
+(( need_batch ))   && front=( "-batchmode" "${front[@]}" )
 (( need_nograph )) && front+=( "-nographics" )
-ARGV=( "${front[@]}" "${rest[@]}" )
+
+# Reassemble ARGV with the executable first
+ARGV=( "$exe" "${front[@]}" "${rest[@]}" )
 
 # Ensure Rust binary exists
 if [[ ! -f "./RustDedicated" ]]; then bad "RustDedicated not found. Enable VALIDATE=1 and retry."; exit 13; fi
@@ -526,6 +531,23 @@ function pkt(id, type, body){const b=Buffer.from(body,'utf8');const len=4+4+b.le
 __RCON_JS__
 }
 
+# -------- Crash bundles (safe) --------
+make_crash_bundle() {
+  [[ "${CRASH_ARCHIVE}" != "1" ]] && return 0
+  local dest="${CRASH_PATH:-/home/container/crashdumps}"
+  if ! mkdir -p "$dest" 2>/dev/null; then
+    warn "Crash bundle directory '$dest' not writable; skipping archive."
+    return 0
+  fi
+  local ts bundle
+  ts="$(date +'%Y-%m-%d_%H-%M-%S')"
+  bundle="${dest}/rust_crash_${ts}.tgz"
+  log "Creating crash bundle at ${bundle}"
+  tar -czf "${bundle}" --ignore-failed-read ./latest.log ./logs 2>/dev/null || \
+    warn "Could not write crash bundle at ${bundle}; continuing without archive."
+  good "Crash bundle step completed."
+}
+
 # -------- Shutdown hooks --------
 shutdown_ran="0"
 run_shutdown_cmds() {
@@ -546,17 +568,6 @@ run_shutdown_cmds() {
       timeout "${SHUTDOWN_TIMEOUT_SEC}" bash -lc "${cmd}" || warn "shutdown command failed or timed out (${SHUTDOWN_TIMEOUT_SEC}s): ${cmd}"
     done
   fi
-}
-
-# -------- Crash bundles --------
-make_crash_bundle() {
-  [[ "${CRASH_ARCHIVE}" != "1" ]] && return 0
-  mkdir -p "${CRASH_PATH}"
-  ts="$(date +'%Y-%m-%d_%H-%M-%S')"
-  bundle="${CRASH_PATH}/rust_crash_${ts}.tgz"
-  log "Creating crash bundle at ${bundle}"
-  tar -czf "${bundle}" --ignore-failed-read ./latest.log ./logs 2>/dev/null || true
-  good "Crash bundle written: ${bundle}"
 }
 
 # -------- Supervision loop (ping-only) --------
