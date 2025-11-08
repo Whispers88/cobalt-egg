@@ -14,7 +14,7 @@ good() { echo -e "${GRN}[ok]${NC} $*"; }
 # niceties
 ulimit -n 65535 || true
 umask 002
-chown -R "$(id -u):$(id -g)" /home/container 2>/dev/null || true
+chown -R "$(id -u):"$(id -g) /home/container 2>/dev/null || true
 
 # SteamCMD layout
 mkdir -p /home/container/Steam/package /home/container/steamcmd /home/container/.steam/sdk32 /home/container/.steam/sdk64
@@ -357,11 +357,50 @@ else
   eval "set -- ${EXPANDED}"
   ARGV=( "$@" )
 fi
+# If someone accidentally included /entrypoint.sh, strip it.
 if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then ARGV=( "${ARGV[@]:1}" ); fi
 
+# --- sanitize ARGV: drop flags with empty values; ensure Unity flags first ---
+rebuild=()
+i=0
+while (( i < ${#ARGV[@]} )); do
+  k="${ARGV[i]}"
+  v=""
+  if (( i+1 < ${#ARGV[@]} )); then v="${ARGV[i+1]}"; fi
+
+  case "$k" in
+    # If these have empty values ("" or all quotes), drop the pair entirely
+    +server.levelurl|+server.headerimage|+server.logoimage|+server.url|+server.tags|+gamemode|+server.description)
+      if [[ -z "${v//\"/}" ]]; then i=$((i+2)); continue; fi
+      ;;
+  esac
+
+  rebuild+=( "$k" )
+  if [[ "$k" == +* ]] && (( i+1 < ${#ARGV[@]} )); then
+    rebuild+=( "$v" ); i=$((i+2)); continue
+  fi
+  i=$((i+1))
+done
+ARGV=( "${rebuild[@]}" )
+
+# Unity flags front; add -nographics if missing
+front=(); rest=()
+for tok in "${ARGV[@]}"; do
+  case "$tok" in
+    -batchmode|-nographics) front+=( "$tok" ) ;;
+    *) rest+=( "$tok" ) ;;
+  esac
+done
+need_nograph=1
+for t in "${front[@]}" "${rest[@]}"; do [[ "$t" == "-nographics" ]] && need_nograph=0; done
+(( need_nograph )) && front+=( "-nographics" )
+ARGV=( "${front[@]}" "${rest[@]}" )
+
+# Ensure Rust binary exists
 if [[ ! -f "./RustDedicated" ]]; then bad "RustDedicated not found. Enable VALIDATE=1 and retry."; exit 13; fi
 [[ -x "./RustDedicated" ]] || chmod +x ./RustDedicated || true
 
+# wrapper
 WRAPPER="/wrapper.js"; [[ -f "$WRAPPER" ]] || WRAPPER="/opt/cobalt/wrapper.js"
 [[ -f "$WRAPPER" ]] || { bad "wrapper.js not found at /wrapper.js or /opt/cobalt/wrapper.js"; exit 14; }
 
