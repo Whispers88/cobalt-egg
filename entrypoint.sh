@@ -6,9 +6,9 @@ RED='\e[31m'; YEL='\e[33m'; GRN='\e[32m'; NC='\e[0m'
 export HOME=/home/container
 cd /home/container || exit 1
 
-log()  { echo -e "[entrypoint] $*"; }
+log() { echo -e "[entrypoint] $*"; }
 warn() { echo -e "${YEL}[warn]${NC} $*"; }
-bad()  { echo -e "${RED}[ERROR]${NC} $*"; }
+bad() { echo -e "${RED}[ERROR]${NC} $*"; }
 good() { echo -e "${GRN}[ok]${NC} $*"; }
 
 # niceties
@@ -26,7 +26,7 @@ steamcmd_path() {
   echo ""
 }
 
-# -------- Panel config --------
+# ---------------- Panel config ----------------
 SRCDS_APPID="${SRCDS_APPID:-258550}"
 
 STEAM_USER="${STEAM_USER:-anonymous}"
@@ -53,16 +53,12 @@ CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
-# Ping-based supervision (watcher starts only after ready token)
 WATCH_ENABLED="${WATCH_ENABLED:-1}"
 HEARTBEAT_TIMEOUT_SEC="${HEARTBEAT_TIMEOUT_SEC:-120}"
-WATCH_CHECK_SEC="${WATCH_CHECK_SEC:-10}"
 
-# Optional convenience IP
-if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
-  APP_PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  export APP_PUBLIC_IP
-fi
+CHECK_EVERY_SEC=10
+STALL_TERM_GRACE_SEC=20
+RESTART_BACKOFF_SEC=5
 
 # Shutdown (single timeout)
 SHUTDOWN_CMDS="${SHUTDOWN_CMDS:-}"
@@ -70,12 +66,12 @@ SHUTDOWN_RCON_CMDS="${SHUTDOWN_RCON_CMDS:-}"
 SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-30}"
 RCON_HOST="${RCON_HOST:-127.0.0.1}"
 
-# Disk & limits awareness (hidden defaults)
+# Disk & limits awareness
 DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-1024}"
-DISK_ENFORCE="${DISK_ENFORCE:-0}" # warn only
+DISK_ENFORCE="${DISK_ENFORCE:-1}"
 HEAP_TARGET_MB="${HEAP_TARGET_MB:-}"
 
-# OOM detector (hidden default)
+# OOM detector
 OOM_WATCH="${OOM_WATCH:-1}"
 OOM_STATE_FILE="/home/container/.oom_seen"
 
@@ -94,10 +90,13 @@ CRASH_PATH="${CRASH_PATH:-/crashdumps}"
 # Preflight port checks
 PREFLIGHT_PORTCHECK="${PREFLIGHT_PORTCHECK:-1}"
 
-# Startup token (kept as hidden var in egg)
-STARTUP_DONE_TOKEN="${STARTUP_DONE_TOKEN:-Server startup complete}"
+# Optional convenience IP
+if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
+  APP_PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  export APP_PUBLIC_IP
+fi
 
-# -------- Limits awareness (red warnings) --------
+# ---------------- Limits awareness (red warnings) ----------------
 cgroup_mem_limit_mb() {
   local lim
   if [[ -r /sys/fs/cgroup/memory.max ]]; then
@@ -115,6 +114,7 @@ cgroup_cpu_quota() {
   if [[ -r /sys/fs/cgroup/cpu.max ]]; then
     awk '{ if ($1=="max") {print "unlimited"} else {printf("%.2f", $1/$2)} }' /sys/fs/cgroup/cpu.max
   elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    awk '{q=$0} END{;} ' /sys/fs/cgroup/cpu/cpu.cfs_quota_us >/dev/null 2>&1
     local q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
     local p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
     if (( q < 0 )); then echo "unlimited"; else awk -v q="$q" -v p="$p" 'BEGIN{printf("%.2f", q/p)}'; fi
@@ -124,7 +124,7 @@ cgroup_cpu_quota() {
 }
 MEM_LIMIT_MB=$(cgroup_mem_limit_mb)
 CPU_LIMIT_CORES=$(cgroup_cpu_quota)
-log "Container limits: memory=${MEM_LIMIT_MB:-0}MB cpu=${CPU_LIMIT_CORES}"
+log "Container limits: memory=${MEM_LIMIT_MB:-0}MB${MEM_LIMIT_MB:+ } cpu=${CPU_LIMIT_CORES} cores"
 if [[ -n "$HEAP_TARGET_MB" && "$MEM_LIMIT_MB" -gt 0 && "$HEAP_TARGET_MB" -gt "$MEM_LIMIT_MB" ]]; then
   echo -e "${RED}[LIMIT] HEAP_TARGET_MB=${HEAP_TARGET_MB}MB exceeds container memory limit ${MEM_LIMIT_MB}MB — expect OOM!${NC}"
 fi
@@ -132,16 +132,21 @@ if [[ "$MEM_LIMIT_MB" -gt 0 && "$MEM_LIMIT_MB" -lt 4096 ]]; then
   echo -e "${RED}[LIMIT] Low container memory (${MEM_LIMIT_MB}MB). Consider 6–8 GB for modded servers.${NC}"
 fi
 
-# -------- Disk-space guard (warn only) --------
+# ---------------- Disk-space guard ----------------
 free_mb=$(df -Pm /home/container | awk 'NR==2{print $4}')
 if (( free_mb < DISK_MIN_FREE_MB )); then
   echo -e "${RED}[DISK] Free space ${free_mb}MB < threshold ${DISK_MIN_FREE_MB}MB on /home/container${NC}"
-  warn "Continuing despite low disk (warn-only)."
+  if [[ "$DISK_ENFORCE" == "1" ]]; then
+    bad "Exiting due to low disk (DISK_ENFORCE=1)."
+    exit 60
+  else
+    warn "Continuing despite low disk (DISK_ENFORCE=0)."
+  fi
 else
   good "Disk free ${free_mb}MB ≥ ${DISK_MIN_FREE_MB}MB"
 fi
 
-# -------- Preflight port checks --------
+# ---------------- Preflight port checks ----------------
 check_port() {
   local proto="$1" port="$2"
   if command -v ss >/dev/null 2>&1; then
@@ -170,17 +175,18 @@ if [[ "$PREFLIGHT_PORTCHECK" == "1" ]]; then
   fi
 fi
 
-# -------- OOM detector --------
+# ---------------- OOM detector ----------------
 oom_read_counter() {
   if [[ -r /sys/fs/cgroup/memory.events ]]; then
     awk '/oom_kill/ {print $2}' /sys/fs/cgroup/memory.events
   elif [[ -r /sys/fs/cgroup/memory/memory.oom_control ]]; then
+    # cgroup v1 lacks a counter; fallback: 0
     echo 0
   else
     echo 0
   fi
 }
-if [[ "${OOM_WATCH}" == "1" ]]; then
+if [[ "$OOM_WATCH" == "1" ]]; then
   prev=$(oom_read_counter)
   if [[ -f "$OOM_STATE_FILE" ]]; then
     last=$(cat "$OOM_STATE_FILE" 2>/dev/null || echo 0)
@@ -203,7 +209,7 @@ if [[ "${OOM_WATCH}" == "1" ]]; then
   ) &
 fi
 
-# -------- Wipe planner (mini cron) --------
+# ---------------- Wipe planner (cron mini) ----------------
 match_cron_field() {
   local field="$1" val="$2"
   [[ "$field" == "*" ]] && return 0
@@ -257,7 +263,7 @@ if [[ "$WIPE_ENABLE" == "1" && -n "$WIPE_CRON" ]]; then
   ) &
 fi
 
-# Apply next world overrides if present
+# ---------------- Apply next world overrides (if present) ----------------
 if [[ -f "$NEXT_OVERRIDES_FILE" ]]; then
   warn "Applying next world overrides from $(basename "$NEXT_OVERRIDES_FILE")."
   # shellcheck disable=SC1090
@@ -265,7 +271,7 @@ if [[ -f "$NEXT_OVERRIDES_FILE" ]]; then
   rm -f "$NEXT_OVERRIDES_FILE" || true
 fi
 
-# -------- Validate / framework install --------
+# ---------------- Validate / framework install ----------------
 do_validate() {
   [[ "${VALIDATE}" != "1" ]] && { log "VALIDATE=0 → skipping SteamCMD validation."; return 0; }
   local SCMD; SCMD="$(steamcmd_path)"
@@ -348,7 +354,7 @@ else
   do_validate
 fi
 
-# -------- Build argv --------
+# ---------------- Build argv ----------------
 if [[ "$#" -gt 0 ]]; then
   ARGV=( "$@" )
 else
@@ -365,98 +371,28 @@ if [[ ! -f "./RustDedicated" ]]; then bad "RustDedicated not found. Enable VALID
 WRAPPER="/wrapper.js"; [[ -f "$WRAPPER" ]] || WRAPPER="/opt/cobalt/wrapper.js"
 [[ -f "$WRAPPER" ]] || { bad "wrapper.js not found at /wrapper.js or /opt/cobalt/wrapper.js"; exit 14; }
 
-# -------- Probes: A2S (UDP) + RCON (TCP) --------
-probe_a2s() {
-  local port="${QUERY_PORT:-}"
-  [[ -z "$port" ]] && return 1
-  python3 - <<'__A2S__' >/dev/null 2>&1 || return 1
-import socket,os,sys
-PORT=int(os.environ.get('QUERY_PORT','0') or 0)
-if PORT<=0: sys.exit(1)
-pkt=b'\xFF\xFF\xFF\xFFTSource Engine Query\x00'
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(1.0)
-try:
-    s.sendto(pkt, ('127.0.0.1', PORT))
-    data,_=s.recvfrom(4096)
-    sys.exit(0 if len(data)>=5 and data[:4]==b'\xFF\xFF\xFF\xFF' and data[4:5]==b'I' else 1)
-except Exception:
-    sys.exit(1)
-finally:
-    s.close()
-__A2S__
-}
-
-probe_rcon() {
-  [[ -z "${RCON_PORT:-}" || -z "${RCON_PASS:-}" ]] && return 1
-  /opt/node/bin/node - <<'__RCON_PING__'
-const net = require('net');
-const HOST = process.env.RCON_HOST || '127.0.0.1';
-const PORT = parseInt(process.env.RCON_PORT || '28016', 10);
-const PASS = process.env.RCON_PASS || '';
-const TIMEOUT_MS = 2000;
-const SERVERDATA_AUTH = 3, SERVERDATA_EXECCOMMAND = 2;
-let id = 1;
-function pkt(i,t,body){const b=Buffer.from(body,'utf8');const len=4+4+b.length+2;const buf=Buffer.alloc(4+len);
-buf.writeInt32LE(len,0);buf.writeInt32LE(i,4);buf.writeInt32LE(t,8);b.copy(buf,12);buf.writeInt8(0,12+b.length);buf.writeInt8(0,13+b.length);return buf;}
-(async()=>{
-  try{
-    const sock = net.createConnection({host:HOST,port:PORT});
-    sock.setTimeout(TIMEOUT_MS, ()=>sock.destroy(new Error('timeout')));
-    await new Promise((res,rej)=>{sock.once('connect',res); sock.once('error',rej);});
-    await new Promise((res,rej)=>{
-      const rid=id++; sock.write(pkt(rid, SERVERDATA_AUTH, PASS));
-      const to=setTimeout(()=>rej(new Error('auth timeout')), TIMEOUT_MS);
-      sock.once('data',(ch)=>{ clearTimeout(to); (ch.readInt32LE(4)===-1)?rej(new Error('auth failed')):res(); });
-      sock.once('error',rej);
-    });
-    sock.write(pkt(id++, SERVERDATA_EXECCOMMAND, 'serverinfo'));
-    setTimeout(()=>{ try{sock.end();}catch{} process.exit(0); }, 50);
-  }catch{ process.exit(1); }
-})();
-__RCON_PING__
-}
-
-# -------- Wait until ready token appears (hard-enabled) --------
-wait_until_ready() {
-  echo "[watch] waiting for startup token '${STARTUP_DONE_TOKEN}' before enabling ping watcher…"
-  while :; do
-    if [[ -n "${LATEST_LOG:-}" && -f "${LATEST_LOG}" ]] && grep -qF -- "${STARTUP_DONE_TOKEN}" "${LATEST_LOG}" 2>/dev/null; then
-      echo "[watch] startup token seen; enabling ping watcher."
-      return 0
-    fi
-    sleep 5
-  done
-}
-
-# -------- Minimal ping-based watcher --------
-ping_watch() {
-  local pid="$1" last_ok now idle
-  last_ok="$(date +%s)"
-  echo "[watch] ping mode: A2S + RCON, interval=${WATCH_CHECK_SEC}s, timeout=${HEARTBEAT_TIMEOUT_SEC}s"
+# ---------------- CPU-only stall watch ----------------
+proc_ticks() { [[ -r "/proc/$1/stat" ]] || { echo 0; return; }; awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+cpu_stall_watch() {
+  local pid="$1" last_ticks cur_ticks last_ts now_ts idle
+  last_ticks="$(proc_ticks "${pid}")"; last_ts="$(date +%s)"
+  echo -e "[watch] pid ${pid}, heartbeat=${HEARTBEAT_TIMEOUT_SEC}s, interval=${CHECK_EVERY_SEC}s"
   trap 'exit 0' TERM INT
   while kill -0 "${pid}" 2>/dev/null; do
-    sleep "${WATCH_CHECK_SEC}"
-    if probe_rcon || probe_a2s; then
-      last_ok="$(date +%s)"
-      continue
-    fi
-    now="$(date +%s)"; idle=$(( now - last_ok ))
+    sleep "${CHECK_EVERY_SEC}"; cur_ticks="$(proc_ticks "${pid}")"
+    if [[ "${cur_ticks}" != "${last_ticks}" && "${cur_ticks}" != "0" ]]; then last_ticks="${cur_ticks}"; last_ts="$(date +%s)"; continue; fi
+    now_ts="$(date +%s)"; idle=$(( now_ts - last_ts ))
     if (( idle >= HEARTBEAT_TIMEOUT_SEC )); then
-      echo -e "${RED}[watch] stall: no successful game ping for ${idle}s (>= ${HEARTBEAT_TIMEOUT_SEC}s). TERM pid ${pid}${NC}"
+      echo -e "${RED}[watch] stall: no CPU progress for ${idle}s (>= ${HEARTBEAT_TIMEOUT_SEC}s). TERM pid ${pid}${NC}"
       kill -TERM "${pid}" 2>/dev/null || true
-      for (( i=0; i<20; i++ )); do
-        sleep 1
-        kill -0 "${pid}" 2>/dev/null || { echo "[watch] process exited after TERM"; exit 0; }
-      done
-      echo -e "${RED}[watch] still running → KILL pid ${pid}${NC}"
-      kill -KILL "${pid}" 2>/dev/null || true
-      exit 0
+      for (( i=0; i<STALL_TERM_GRACE_SEC; i++ )); do sleep 1; kill -0 "${pid}" 2>/dev/null || { echo "[watch] exited after TERM"; exit 0; }; done
+      echo -e "${RED}[watch] still running → KILL pid ${pid}${NC}"; kill -KILL "${pid}" 2>/dev/null || true; exit 0
     fi
   done
   exit 0
 }
 
-# -------- RCON helper (shutdown/wipe) --------
+# ---------------- RCON helper (shutdown/wipe) ----------------
 send_rcon_cmds() {
   local cmds_csv="$1"
   [[ -z "${cmds_csv// }" ]] && return 0
@@ -470,24 +406,14 @@ const TIMEOUT_MS = (parseInt(process.env.SHUTDOWN_TIMEOUT_SEC || '30', 10)*1000)
 const CMDS = (process.env.SHUTDOWN_RCON_CMDS || process.env.WIPE_RCON_CMDS || '').split(',').map(s=>s.trim()).filter(Boolean);
 const SERVERDATA_AUTH = 3, SERVERDATA_EXECCOMMAND = 2; let reqId = 1;
 function pkt(id, type, body){const b=Buffer.from(body,'utf8');const len=4+4+b.length+2;const buf=Buffer.alloc(4+len);buf.writeInt32LE(len,0);buf.writeInt32LE(id,4);buf.writeInt32LE(type,8);b.copy(buf,12);buf.writeInt8(0,12+b.length);buf.writeInt8(0,13+b.length);return buf;}
-(async()=>{
-  try{
-    const sock = net.createConnection({host:HOST,port:PORT});
-    sock.setTimeout(TIMEOUT_MS, ()=>sock.destroy(new Error('timeout')));
-    await new Promise((res,rej)=>{sock.once('connect',res); sock.once('error',rej);});
-    await new Promise((res,rej)=>{
-      const rid=reqId++; sock.write(pkt(rid, SERVERDATA_AUTH, PASS));
-      const to=setTimeout(()=>rej(new Error('auth timeout')), TIMEOUT_MS);
-      sock.once('data',(ch)=>{ clearTimeout(to); (ch.readInt32LE(4)===-1)?rej(new Error('auth failed')):res(); });
-    });
-    for (const c of CMDS){ try{ sock.write(pkt(reqId++, SERVERDATA_EXECCOMMAND, c)); } catch{} }
-    setTimeout(()=>{ try{sock.end();}catch{} process.exit(0); }, 50);
-  }catch{ process.exit(1); }
-})();
+function connect(){return new Promise((res,rej)=>{const s=net.createConnection({host:HOST,port:PORT},()=>res(s));s.setTimeout(TIMEOUT_MS,()=>{s.destroy(new Error('timeout'));});s.on('error',rej);});}
+async function auth(sock){return new Promise((res,rej)=>{const id=reqId++;sock.write(pkt(id,SERVERDATA_AUTH,PASS));let ok=false;const onData=(ch)=>{const rid=ch.readInt32LE(4);if(rid===-1){sock.off('data',onData);rej(new Error('auth failed'));}else{ok=true;sock.off('data',onData);res();}};sock.on('data',onData);setTimeout(()=>{if(!ok){sock.off('data',onData);rej(new Error('auth timeout'));}},TIMEOUT_MS);});}
+async function exec(sock,cmd){return new Promise((res)=>{sock.write(pkt(reqId++,SERVERDATA_EXECCOMMAND,cmd));setTimeout(res,200);});}
+(async()=>{if(CMDS.length===0)process.exit(0);const sock=await connect().catch(e=>{console.error('[rcon] connect failed:',e.message);process.exit(2);});try{await auth(sock);}catch(e){console.error('[rcon] auth failed:',e.message);sock.destroy();process.exit(3);}for(const c of CMDS){try{console.log('[rcon] cmd:',c);await exec(sock,c);}catch{}}try{sock.end();}catch{}setTimeout(()=>process.exit(0),50);})();
 __RCON_JS__
 }
 
-# -------- Shutdown hooks --------
+# ---------------- Shutdown hooks ----------------
 shutdown_ran="0"
 run_shutdown_cmds() {
   [[ "${shutdown_ran}" == "1" ]] && return 0
@@ -509,18 +435,20 @@ run_shutdown_cmds() {
   fi
 }
 
-# -------- Crash bundles --------
+# ---------------- Crash bundles ----------------
 make_crash_bundle() {
   [[ "${CRASH_ARCHIVE}" != "1" ]] && return 0
   mkdir -p "${CRASH_PATH}"
   ts="$(date +'%Y-%m-%d_%H-%M-%S')"
   bundle="${CRASH_PATH}/rust_crash_${ts}.tgz"
   log "Creating crash bundle at ${bundle}"
-  tar -czf "${bundle}" --ignore-failed-read ./latest.log ./logs 2>/dev/null || true
+  tar -czf "${bundle}" \
+    --ignore-failed-read \
+    ./latest.log ./logs 2>/dev/null || true
   good "Crash bundle written: ${bundle}"
 }
 
-# -------- Supervision loop (ping-only) --------
+# ---------------- Supervision loop ----------------
 child_pid=""; term_requested="0"
 trap 'term_requested="1"; [[ -n "${child_pid}" ]] && kill -TERM "${child_pid}" 2>/dev/null || true' TERM INT
 
@@ -530,7 +458,7 @@ while :; do
   child_pid="$!"
 
   if [[ "${WATCH_ENABLED}" == "1" ]]; then
-    ( wait_until_ready; kill -0 "${child_pid}" 2>/dev/null && ping_watch "${child_pid}" ) & stall_pid="$!"
+    cpu_stall_watch "${child_pid}" & stall_pid="$!"
   fi
 
   rc=0
@@ -545,7 +473,7 @@ while :; do
     exit "${rc}"
   fi
 
-  warn "Server crashed/terminated (rc=${rc}). Restarting in 5s…"
+  warn "Server crashed/terminated (rc=${rc}). Restarting in ${RESTART_BACKOFF_SEC}s…"
   make_crash_bundle
-  sleep 5
+  sleep "${RESTART_BACKOFF_SEC}"
 done
