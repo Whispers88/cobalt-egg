@@ -50,12 +50,15 @@ case "${FRAMEWORK}" in
 esac
 
 CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
-
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
-WATCH_ENABLED="${WATCH_ENABLED:-1}"               # informational; no bash watcher when using exec model
-HEARTBEAT_TIMEOUT_SEC="${HEARTBEAT_TIMEOUT_SEC:-120}"
+# RCON defaults (used by wrapper if panel input is RCON-routed)
+export RCON_HOST="${RCON_HOST:-127.0.0.1}"
+export RCON_PORT="${RCON_PORT:-28016}"
+export RCON_PASS="${RCON_PASS:-}"
 
+WATCH_ENABLED="${WATCH_ENABLED:-1}"
+HEARTBEAT_TIMEOUT_SEC="${HEARTBEAT_TIMEOUT_SEC:-120}"
 CHECK_EVERY_SEC=10
 STALL_TERM_GRACE_SEC=20
 RESTART_BACKOFF_SEC=5
@@ -64,7 +67,6 @@ RESTART_BACKOFF_SEC=5
 SHUTDOWN_CMDS="${SHUTDOWN_CMDS:-}"
 SHUTDOWN_RCON_CMDS="${SHUTDOWN_RCON_CMDS:-}"
 SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-30}"
-RCON_HOST="${RCON_HOST:-127.0.0.1}"
 
 # Disk & limits awareness
 DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-1024}"
@@ -244,6 +246,7 @@ trigger_wipe() {
     log "Next world overrides saved to $(basename "$NEXT_OVERRIDES_FILE")."
   fi
 }
+
 if [[ "$WIPE_ENABLE" == "1" && -n "$WIPE_CRON" ]]; then
   (
     trap 'exit 0' TERM INT
@@ -285,7 +288,6 @@ do_validate() {
 
 # ---------------- Framework installers ----------------
 install_oxide() {
-  # Accept: oxide, oxide-release, uMod (release) | oxide-staging (staging)
   local channel="release"
   case "${FRAMEWORK}" in
     oxide-staging|uMod-staging|oxide_staging) channel="staging" ;;
@@ -409,6 +411,6 @@ async function exec(sock,cmd){return new Promise((res)=>{sock.write(pkt(reqId++,
 __RCON_JS__
 }
 
-# ---------------- Launch (wrapper is PID 1; inherits panel stdin) ----------------
+# ---------------- Launch (wrapper is PID 1; panel input goes to wrapper) ----------------
 log "Launching via wrapper (argv mode)…"
 exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
