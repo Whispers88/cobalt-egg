@@ -231,8 +231,8 @@ cron_matches_now() {
   nmin=$(date +%M); nhour=$(date +%H); ndom=$(date +%d); nmon=$(date +%m); ndow=$(date +%w)
   match_cron_field "$min" "$((10#$nmin))" && \
   match_cron_field "$hour" "$((10#$nhour))" && \
-  match_cron_field "$dom" "$((10#$ndom))" && \
-  match_cron_field "$mon" "$((10#$nmon))" && \
+  match_cron_field "$dom" "$((10#$ndom))" ) && \
+  match_cron_field "$mon" "$((10#$nmon))" ) && \
   match_cron_field "$dow" "$((10#$ndow))"
 }
 trigger_wipe() {
@@ -435,28 +435,26 @@ run_shutdown_cmds() {
   fi
 }
 
-# ---------------- Crash bundles ----------------
-make_crash_bundle() {
-  [[ "${CRASH_ARCHIVE}" != "1" ]] && return 0
-  mkdir -p "${CRASH_PATH}"
-  ts="$(date +'%Y-%m-%d_%H-%M-%S')"
-  bundle="${CRASH_PATH}/rust_crash_${ts}.tgz"
-  log "Creating crash bundle at ${bundle}"
-  tar -czf "${bundle}" \
-    --ignore-failed-read \
-    ./latest.log ./logs 2>/dev/null || true
-  good "Crash bundle written: ${bundle}"
-}
-
-# ---------------- Supervision loop ----------------
+# ---------------- Supervision loop (with stdin forwarding) ----------------
 child_pid=""; term_requested="0"
 trap 'term_requested="1"; [[ -n "${child_pid}" ]] && kill -TERM "${child_pid}" 2>/dev/null || true' TERM INT
 
-log "Launching via wrapper (argv mode)…"
+log "Launching via wrapper (argv mode) with stdin forwarding…"
 while :; do
   /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}" &
   child_pid="$!"
 
+  # Bridge panel stdin -> child stdin
+  if [[ -e "/proc/${child_pid}/fd/0" ]]; then
+    # This background cat stays attached to PID 1 stdin; data is written to child's fd 0.
+    cat > "/proc/${child_pid}/fd/0" &
+    forward_pid="$!"
+  else
+    warn "Could not open /proc/${child_pid}/fd/0 for stdin forwarding."
+    forward_pid=""
+  fi
+
+  # Optional stall watch
   if [[ "${WATCH_ENABLED}" == "1" ]]; then
     cpu_stall_watch "${child_pid}" & stall_pid="$!"
   fi
@@ -464,8 +462,9 @@ while :; do
   rc=0
   wait "${child_pid}" || rc=$?
 
+  # Cleanup helpers
   [[ -n "${stall_pid:-}" ]] && kill -TERM "${stall_pid}" 2>/dev/null || true
-  unset stall_pid
+  [[ -n "${forward_pid:-}" ]] && kill -TERM "${forward_pid}" 2>/dev/null || true
 
   if [[ "${WATCH_ENABLED}" != "1" || "${rc}" -eq 0 || "${term_requested}" == "1" ]]; then
     [[ "${rc}" -ne 0 ]] && make_crash_bundle
