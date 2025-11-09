@@ -7,14 +7,16 @@
 // - Panel input:
 //     * "! <cmd>"     => run shell in container
 //     * "stdin: <x>"  => send to Rust STDIN (console)
-//     * "console: <x>"=> alias of stdin:
+//     * "console: <x>"=> alias of stdin
 //     * "rcon: <x>"   => send via RCON
 //     * default route => controlled by CONSOLE_MODE (stdin|rcon|auto)
 // - `.mode stdin|rcon|auto` at runtime switches default route
 // - Prints RCON response payloads
+// - NEW: runs the game via `stdbuf -oL -eL` for line-buffered output (if available)
+// - NEW: prints an ack when sending to STDIN so you see something immediately
 // ============================================================================
 
-const { spawn } = require("child_process");
+const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
 
@@ -39,6 +41,7 @@ const C = COLOR_OK
 const hhmm = () => { const d = new Date(); const p = n => String(n).padStart(2,"0"); return `${p(d.getHours())}:${p(d.getMinutes())}`; };
 const looksLikeFlag = (s) => typeof s === "string" && /^[-+][A-Za-z0-9_.-]+$/.test(s);
 const SWITCH_ONLY = new Set(["-batchmode","-nographics","-nolog","-no-gui"]);
+const which = (bin) => { try { return execSync(`command -v ${bin}`, {stdio:["ignore","pipe","ignore"]}).toString().trim(); } catch { return ""; } };
 
 function repairSplitArgs(params){
   const out=[]; for(let i=0;i<params.length;){
@@ -118,8 +121,19 @@ function emitPretty(sourceKey, chunk, isErr=false){
   }
 }
 
-// ---------- spawn Rust ----------
-const game = spawn(executable, params, { stdio: ["pipe","pipe","pipe"], cwd: "/home/container" });
+// ---------- spawn Rust (force line-buffer via stdbuf if available) ----------
+const stdbuf = which("stdbuf");
+let cmd, args;
+if (stdbuf) {
+  cmd = stdbuf;
+  args = ["-oL", "-eL", executable, ...params];
+  process.stdout.write(`${C.dim}${hhmm()}${C.reset} using stdbuf for line-buffered output\n`);
+} else {
+  cmd = executable;
+  args = params;
+  process.stdout.write(`${C.dim}${hhmm()}${C.reset} stdbuf not found; output may be buffered\n`);
+}
+const game = spawn(cmd, args, { stdio: ["pipe","pipe","pipe"], cwd: "/home/container" });
 game.stdout.on("data", d => emitPretty("game", d, false));
 game.stderr.on("data", d => emitPretty("game", d, true));
 
@@ -132,6 +146,8 @@ if(unityLogfile){
   const tailMirror = d => emitPretty("unity", d, false);
   tailProc.stdout.on("data", tailMirror);
   tailProc.stderr.on("data", tailMirror);
+} else {
+  process.stdout.write(`${C.dim}${hhmm()}${C.reset} No -logfile specified; consider adding: -logfile /home/container/unity.log\n`);
 }
 
 // ---------- RCON helpers ----------
@@ -144,11 +160,11 @@ function pkt(id,type,body){
   b.copy(buf,12); buf.writeInt8(0,12+b.length); buf.writeInt8(0,13+b.length);
   return buf;
 }
-function sendRconOnce(cmd){
+function sendRconOnce(cmdTxt){
   return new Promise((resolve,reject)=>{
     const s=net.createConnection({host:RCON_HOST,port:RCON_PORT},()=>{
       s.write(pkt(1,SERVERDATA_AUTH,RCON_PASS));
-      setTimeout(()=>s.write(pkt(2,SERVERDATA_EXECCOMMAND,cmd)),150);
+      setTimeout(()=>s.write(pkt(2,SERVERDATA_EXECCOMMAND,cmdTxt)),150);
     });
     const chunks=[];
     s.on("data",d=>chunks.push(d));
@@ -226,10 +242,14 @@ process.stdin.on("data", (txt)=>{
       route = "stdin";
     }
 
-    // 5) Dispatch
+    // 5) Dispatch (with STDIN ack)
     if (route === "stdin") {
-      try { game.stdin.write(payload + "\n"); }
-      catch { process.stdout.write(`${C.fg.red}${hhmm()} [stdin] failed to write${C.reset}\n`); }
+      try {
+        game.stdin.write(payload + "\n");
+        process.stdout.write(`${C.dim}${hhmm()}${C.reset} [stdin] ${payload}\n`);
+      } catch {
+        process.stdout.write(`${C.fg.red}${hhmm()} [stdin] failed to write${C.reset}\n`);
+      }
     } else {
       sendRconOnce(payload)
         .then(buf=>{
