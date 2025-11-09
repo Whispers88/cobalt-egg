@@ -2,14 +2,13 @@
 set -euo pipefail
 
 RED='\e[31m'; YEL='\e[33m'; GRN='\e[32m'; NC='\e[0m'
-
-export HOME=/home/container
-cd /home/container || exit 1
-
 log()  { echo -e "[entrypoint] $*"; }
 warn() { echo -e "${YEL}[warn]${NC} $*"; }
 bad()  { echo -e "${RED}[ERROR]${NC} $*"; }
 good() { echo -e "${GRN}[ok]${NC} $*"; }
+
+export HOME=/home/container
+cd /home/container || exit 1
 
 # niceties
 ulimit -n 65535 || true
@@ -46,22 +45,17 @@ case "${FRAMEWORK}" in
   vanilla-staging|oxide-staging|carbon-staging* ) DEFAULT_STEAM_BRANCH="staging" ;;
   vanilla-aux1|carbon-aux1* )                     DEFAULT_STEAM_BRANCH="aux1" ;;
   vanilla-aux2|carbon-aux2* )                     DEFAULT_STEAM_BRANCH="aux2" ;;
-  * )                                             DEFAULT_STEAM_BRANCH="" ;;
 esac
 
 CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
-# RCON defaults (used by wrapper if panel input is RCON-routed)
+# RCON defaults (used for graceful shutdown)
 export RCON_HOST="${RCON_HOST:-127.0.0.1}"
 export RCON_PORT="${RCON_PORT:-28016}"
 export RCON_PASS="${RCON_PASS:-}"
 
-WATCH_ENABLED="${WATCH_ENABLED:-1}"
-HEARTBEAT_TIMEOUT_SEC="${HEARTBEAT_TIMEOUT_SEC:-120}"
-CHECK_EVERY_SEC=10
-STALL_TERM_GRACE_SEC=20
-RESTART_BACKOFF_SEC=5
+# Removed heartbeat-related vars (WATCH_ENABLED/HEARTBEAT/CHECK loops)
 
 # Shutdown (single timeout)
 SHUTDOWN_CMDS="${SHUTDOWN_CMDS:-}"
@@ -73,21 +67,9 @@ DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-1024}"
 DISK_ENFORCE="${DISK_ENFORCE:-1}"
 HEAP_TARGET_MB="${HEAP_TARGET_MB:-}"
 
-# OOM detector
+# OOM detector (kept, but no wrapper)
 OOM_WATCH="${OOM_WATCH:-1}"
 OOM_STATE_FILE="/home/container/.oom_seen"
-
-# Wipe planner
-WIPE_ENABLE="${WIPE_ENABLE:-0}"
-WIPE_CRON="${WIPE_CRON:-}"
-WIPE_RCON_CMDS="${WIPE_RCON_CMDS:-global.say \"Wipe in progress\",save.all,quit}"
-NEXT_WORLD_SIZE="${NEXT_WORLD_SIZE:-}"
-NEXT_WORLD_SEED="${NEXT_WORLD_SEED:-}"
-NEXT_OVERRIDES_FILE="/home/container/.next_world.env"
-
-# Crash bundles
-CRASH_ARCHIVE="${CRASH_ARCHIVE:-1}"
-CRASH_PATH="${CRASH_PATH:-/crashdumps}"
 
 # Preflight port checks
 PREFLIGHT_PORTCHECK="${PREFLIGHT_PORTCHECK:-1}"
@@ -98,16 +80,14 @@ if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
   export APP_PUBLIC_IP
 fi
 
-# ---------------- Limits awareness (red warnings) ----------------
+# ---------------- Limits awareness ----------------
 cgroup_mem_limit_mb() {
   local lim
   if [[ -r /sys/fs/cgroup/memory.max ]]; then
-    lim=$(cat /sys/fs/cgroup/memory.max)
-    [[ "$lim" == "max" ]] && { echo 0; return; }
+    lim=$(cat /sys/fs/cgroup/memory.max); [[ "$lim" == "max" ]] && { echo 0; return; }
     echo $(( lim/1024/1024 ))
   elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
-    lim=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
-    echo $(( lim/1024/1024 ))
+    lim=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes); echo $(( lim/1024/1024 ))
   else
     echo 0
   fi
@@ -116,8 +96,7 @@ cgroup_cpu_quota() {
   if [[ -r /sys/fs/cgroup/cpu.max ]]; then
     awk '{ if ($1=="max") {print "unlimited"} else {printf("%.2f", $1/$2)} }' /sys/fs/cgroup/cpu.max
   elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
-    local q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
-    local p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    local q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us) p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
     if (( q < 0 )); then echo "unlimited"; else awk -v q="$q" -v p="$p" 'BEGIN{printf("%.2f", q/p)}'; fi
   else
     echo "unknown"
@@ -137,12 +116,7 @@ fi
 free_mb=$(df -Pm /home/container | awk 'NR==2{print $4}')
 if (( free_mb < DISK_MIN_FREE_MB )); then
   echo -e "${RED}[DISK] Free space ${free_mb}MB < threshold ${DISK_MIN_FREE_MB}MB on /home/container${NC}"
-  if [[ "$DISK_ENFORCE" == "1" ]]; then
-    bad "Exiting due to low disk (DISK_ENFORCE=1)."
-    exit 60
-  else
-    warn "Continuing despite low disk (DISK_ENFORCE=0)."
-  fi
+  if [[ "$DISK_ENFORCE" == "1" ]]; then bad "Exiting due to low disk (DISK_ENFORCE=1)."; exit 60; else warn "Continuing despite low disk (DISK_ENFORCE=0)."; fi
 else
   good "Disk free ${free_mb}MB ≥ ${DISK_MIN_FREE_MB}MB"
 fi
@@ -170,18 +144,13 @@ if [[ "$PREFLIGHT_PORTCHECK" == "1" ]]; then
       fail=1
     fi
   done
-  if (( fail )); then
-    bad "Preflight port check failed — fix bindings or change ports."
-    exit 61
-  fi
+  (( fail )) && { bad "Preflight port check failed — fix bindings or change ports."; exit 61; }
 fi
 
-# ---------------- OOM detector ----------------
+# ---------------- OOM detector (non-invasive) ----------------
 oom_read_counter() {
   if [[ -r /sys/fs/cgroup/memory.events ]]; then
     awk '/oom_kill/ {print $2}' /sys/fs/cgroup/memory.events
-  elif [[ -r /sys/fs/cgroup/memory/memory.oom_control ]]; then
-    echo 0
   else
     echo 0
   fi
@@ -195,81 +164,6 @@ if [[ "$OOM_WATCH" == "1" ]]; then
     fi
   fi
   printf "%s" "$prev" > "$OOM_STATE_FILE" || true
-  (
-    trap 'exit 0' TERM INT
-    while :; do
-      sleep 5
-      cur=$(oom_read_counter)
-      if (( cur > prev )); then
-        echo -e "${RED}[OOM] Detected OOM kill (${cur-prev} new). Server may crash or become unstable.${NC}"
-        prev="$cur"
-        printf "%s" "$prev" > "$OOM_STATE_FILE" || true
-      fi
-    done
-  ) &
-fi
-
-# ---------------- Wipe planner (cron mini) ----------------
-match_cron_field() {
-  local field="$1" val="$2"
-  [[ "$field" == "*" ]] && return 0
-  IFS=',' read -ra parts <<< "$field"
-  for p in "${parts[@]}"; do
-    if [[ "$p" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-      [[ "$val" -ge "${BASH_REMATCH[1]}" && "$val" -le "${BASH_REMATCH[2]}" ]] && return 0
-    elif [[ "$p" =~ ^\*/([0-9]+)$ ]]; then
-      (( val % ${BASH_REMATCH[1]} == 0 )) && return 0
-    elif [[ "$p" =~ ^[0-9]+$ ]]; then
-      [[ "$val" -eq "$p" ]] && return 0
-    fi
-  done
-  return 1
-}
-cron_matches_now() {
-  local min hour dom mon dow; read -r min hour dom mon dow <<< "$1"
-  local nmin nhour ndom nmon ndow
-  nmin=$(date +%M); nhour=$(date +%H); ndom=$(date +%d); nmon=$(date +%m); ndow=$(date +%w)
-  match_cron_field "$min" "$((10#$nmin))" && \
-  match_cron_field "$hour" "$((10#$nhour))" && \
-  match_cron_field "$dom" "$((10#$ndom))" && \
-  match_cron_field "$mon" "$((10#$nmon))" && \
-  match_cron_field "$dow" "$((10#$ndow))"
-}
-trigger_wipe() {
-  echo -e "${YEL}[wipe] Triggering wipe via RCON & quit…${NC}"
-  SHUTDOWN_RCON_CMDS="${WIPE_RCON_CMDS}" send_rcon_cmds "${WIPE_RCON_CMDS}" || warn "Wipe RCON cmds may have failed."
-  if [[ -n "$NEXT_WORLD_SIZE" || -n "$NEXT_WORLD_SEED" ]]; then
-    {
-      [[ -n "$NEXT_WORLD_SIZE" ]] && echo "WORLD_SIZE=${NEXT_WORLD_SIZE}"
-      [[ -n "$NEXT_WORLD_SEED" ]] && echo "WORLD_SEED=${NEXT_WORLD_SEED}"
-    } > "$NEXT_OVERRIDES_FILE"
-    log "Next world overrides saved to $(basename "$NEXT_OVERRIDES_FILE")."
-  fi
-}
-
-if [[ "$WIPE_ENABLE" == "1" && -n "$WIPE_CRON" ]]; then
-  (
-    trap 'exit 0' TERM INT
-    last_min=""
-    while :; do
-      now_min="$(date +%Y%m%d%H%M)"
-      if [[ "$now_min" != "$last_min" ]]; then
-        last_min="$now_min"
-        if cron_matches_now "$WIPE_CRON"; then
-          trigger_wipe
-        fi
-      fi
-      sleep 5
-    done
-  ) &
-fi
-
-# ---------------- Apply next world overrides (if present) ----------------
-if [[ -f "$NEXT_OVERRIDES_FILE" ]]; then
-  warn "Applying next world overrides from $(basename "$NEXT_OVERRIDES_FILE")."
-  # shellcheck disable=SC1090
-  source "$NEXT_OVERRIDES_FILE" || true
-  rm -f "$NEXT_OVERRIDES_FILE" || true
 fi
 
 # ---------------- Validate / framework install ----------------
@@ -286,21 +180,17 @@ do_validate() {
   good "Steam files validated."
 }
 
-# ---------------- Framework installers ----------------
 install_oxide() {
   local channel="release"
   case "${FRAMEWORK}" in
     oxide-staging|uMod-staging|oxide_staging) channel="staging" ;;
-    *)                                         channel="release" ;;
   esac
-
   local url=""
   if [[ "$channel" == "staging" ]]; then
     url="https://downloads.oxidemod.com/artifacts/Oxide.Rust/staging/Oxide.Rust-linux.zip"
   else
     url="https://downloads.oxidemod.com/artifacts/Oxide.Rust/release/Oxide.Rust-linux.zip"
   fi
-
   log "Installing Oxide (channel: ${channel})…"
   local tmp; tmp="$(mktemp -d)"; pushd "$tmp" >/dev/null
   curl -fSL --retry 5 -o oxide.zip "${url}"
@@ -363,9 +253,9 @@ if [[ "${FRAMEWORK_UPDATE}" == "1" ]]; then
     install_from_custom_url "${CUSTOM_FRAMEWORK_URL}"
   else
     case "${FRAMEWORK}" in
-      oxide|oxide-release|uMod|uMod-release|oxide-staging|uMod-staging) install_oxide ;;
-      carbon*   ) install_carbon ;;
-      *         ) log "Vanilla channel; no framework to install." ;;
+      oxide*|uMod*) install_oxide ;;
+      carbon* )     install_carbon ;;
+      * )           log "Vanilla channel; no framework to install." ;;
     esac
   fi
 else
@@ -387,10 +277,7 @@ if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then ARGV=( "$
 if [[ ! -f "./RustDedicated" ]]; then bad "RustDedicated not found. Enable VALIDATE=1 and retry."; exit 13; fi
 [[ -x "./RustDedicated" ]] || chmod +x ./RustDedicated || true
 
-WRAPPER="/wrapper.js"; [[ -f "$WRAPPER" ]] || WRAPPER="/opt/cobalt/wrapper.js"
-[[ -f "$WRAPPER" ]] || { bad "wrapper.js not found at /wrapper.js or /opt/cobalt/wrapper.js"; exit 14; }
-
-# ---------------- RCON helper (shutdown/wipe) ----------------
+# ---------------- RCON helper (for shutdown) ----------------
 send_rcon_cmds() {
   local cmds_csv="$1"
   [[ -z "${cmds_csv// }" ]] && return 0
@@ -401,16 +288,31 @@ const HOST=process.env.RCON_HOST||'127.0.0.1';
 const PORT=parseInt(process.env.RCON_PORT||'28016',10);
 const PASS=process.env.RCON_PASS||'';
 const TIMEOUT_MS=(parseInt(process.env.SHUTDOWN_TIMEOUT_SEC||'30',10)*1000)||30000;
-const CMDS=(process.env.SHUTDOWN_RCON_CMDS||process.env.WIPE_RCON_CMDS||'').split(',').map(s=>s.trim()).filter(Boolean);
+const CMDS=(process.env.SHUTDOWN_RCON_CMDS||'').split(',').map(s=>s.trim()).filter(Boolean);
 const SERVERDATA_AUTH=3,SERVERDATA_EXECCOMMAND=2;let reqId=1;
 function pkt(id,type,body){const b=Buffer.from(body,'utf8');const len=4+4+b.length+2;const buf=Buffer.alloc(4+len);buf.writeInt32LE(len,0);buf.writeInt32LE(id,4);buf.writeInt32LE(type,8);b.copy(buf,12);buf.writeInt8(0,12+b.length);buf.writeInt8(0,13+b.length);return buf;}
 function connect(){return new Promise((res,rej)=>{const s=net.createConnection({host:HOST,port:PORT},()=>res(s));s.setTimeout(TIMEOUT_MS,()=>{s.destroy(new Error('timeout'));});s.on('error',rej);});}
-async function auth(sock){return new Promise((res,rej)=>{const id=reqId++;sock.write(pkt(id,SERVERDATA_AUTH,PASS));let ok=false;const onData=(ch)=>{const rid=ch.readInt32LE(4);if(rid===-1){sock.off('data',onData);rej(new Error('auth failed'));}else{ok=true;sock.off('data',onData);res();}};sock.on('data',onData);setTimeout(()=>{if(!ok){sock.off('data',onData);rej(new Error('auth timeout'));}},TIMEOUT_MS);});}
+async function auth(sock){return new Promise((res,rej)=>{const id=reqId++;sock.write(pkt(id,SERVERDATA_AUTH,PASS));let done=false;const onData=(ch)=>{const rid=ch.readInt32LE(4);if(rid===-1){sock.off('data',onData);rej(new Error('auth failed'));}else{done=true;sock.off('data',onData);res();}};sock.on('data',onData);setTimeout(()=>{if(!done){sock.off('data',onData);rej(new Error('auth timeout'));}},TIMEOUT_MS);});}
 async function exec(sock,cmd){return new Promise((res)=>{sock.write(pkt(reqId++,SERVERDATA_EXECCOMMAND,cmd));setTimeout(res,200);});}
 (async()=>{if(CMDS.length===0)process.exit(0);const sock=await connect().catch(e=>{console.error("[rcon] connect failed:",e.message);process.exit(2);});try{await auth(sock);}catch(e){console.error("[rcon] auth failed:",e.message);sock.destroy();process.exit(3);}for(const c of CMDS){try{console.log("[rcon] cmd:",c);await exec(sock,c);}catch{}}try{sock.end();}catch{}setTimeout(()=>process.exit(0),50);})();
 __RCON_JS__
 }
 
-# ---------------- Launch (wrapper is PID 1; panel input goes to wrapper) ----------------
-log "Launching via wrapper (argv mode)…"
-exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
+# ---------------- Graceful shutdown trap ----------------
+TERM_CHILD_PID=""
+on_term() {
+  warn "Received termination signal — sending shutdown commands and stopping server…"
+  [[ -n "$SHUTDOWN_RCON_CMDS" ]] && send_rcon_cmds "$SHUTDOWN_RCON_CMDS" || true
+  if [[ -n "$TERM_CHILD_PID" ]]; then kill -TERM "$TERM_CHILD_PID" 2>/dev/null || true; fi
+  sleep "${SHUTDOWN_TIMEOUT_SEC}"
+  exit 0
+}
+trap on_term INT TERM
+
+# ---------------- Launch server directly (no wrapper/heartbeat) ----------------
+log "Launching RustDedicated (direct)…"
+set +e
+./RustDedicated "${ARGV[@]}" &
+TERM_CHILD_PID=$!
+wait $!
+exit $?
