@@ -6,9 +6,9 @@ RED='\e[31m'; YEL='\e[33m'; GRN='\e[32m'; NC='\e[0m'
 export HOME=/home/container
 cd /home/container || exit 1
 
-log() { echo -e "[entrypoint] $*"; }
+log()  { echo -e "[entrypoint] $*"; }
 warn() { echo -e "${YEL}[warn]${NC} $*"; }
-bad() { echo -e "${RED}[ERROR]${NC} $*"; }
+bad()  { echo -e "${RED}[ERROR]${NC} $*"; }
 good() { echo -e "${GRN}[ok]${NC} $*"; }
 
 # niceties
@@ -53,7 +53,7 @@ CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
-WATCH_ENABLED="${WATCH_ENABLED:-1}"               # retained for messages; stall watch removed in exec mode
+WATCH_ENABLED="${WATCH_ENABLED:-1}"               # informational; no bash watcher when using exec model
 HEARTBEAT_TIMEOUT_SEC="${HEARTBEAT_TIMEOUT_SEC:-120}"
 
 CHECK_EVERY_SEC=10
@@ -216,7 +216,7 @@ match_cron_field() {
     if [[ "$p" =~ ^([0-9]+)-([0-9]+)$ ]]; then
       [[ "$val" -ge "${BASH_REMATCH[1]}" && "$val" -le "${BASH_REMATCH[2]}" ]] && return 0
     elif [[ "$p" =~ ^\*/([0-9]+)$ ]]; then
-      (( val % ${BASHREMATCH[1]} == 0 )) && return 0
+      (( val % ${BASH_REMATCH[1]} == 0 )) && return 0
     elif [[ "$p" =~ ^[0-9]+$ ]]; then
       [[ "$val" -eq "$p" ]] && return 0
     fi
@@ -394,18 +394,18 @@ send_rcon_cmds() {
   [[ -z "${cmds_csv// }" ]] && return 0
   [[ -z "${RCON_PORT:-}" || -z "${RCON_PASS:-}" ]] && { warn "RCON not configured; skipping RCON cmds."; return 1; }
   /opt/node/bin/node - <<'__RCON_JS__' || return $?
-const net = require('net');
-const HOST = process.env.RCON_HOST || '127.0.0.1';
-const PORT = parseInt(process.env.RCON_PORT || '28016', 10);
-const PASS = process.env.RCON_PASS || '';
-const TIMEOUT_MS = (parseInt(process.env.SHUTDOWN_TIMEOUT_SEC || '30', 10)*1000) || 30000;
-const CMDS = (process.env.SHUTDOWN_RCON_CMDS || process.env.WIPE_RCON_CMDS || '').split(',').map(s=>s.trim()).filter(Boolean);
-const SERVERDATA_AUTH = 3, SERVERDATA_EXECCOMMAND = 2; let reqId = 1;
-function pkt(id, type, body){const b=Buffer.from(body,'utf8');const len=4+4+b.length+2;const buf=Buffer.alloc(4+len);buf.writeInt32LE(len,0);buf.writeInt32LE(id,4);buf.writeInt32LE(type,8);b.copy(buf,12);buf.writeInt8(0,12+b.length);buf.writeInt8(0,13+b.length);return buf;}
+const net=require('net');
+const HOST=process.env.RCON_HOST||'127.0.0.1';
+const PORT=parseInt(process.env.RCON_PORT||'28016',10);
+const PASS=process.env.RCON_PASS||'';
+const TIMEOUT_MS=(parseInt(process.env.SHUTDOWN_TIMEOUT_SEC||'30',10)*1000)||30000;
+const CMDS=(process.env.SHUTDOWN_RCON_CMDS||process.env.WIPE_RCON_CMDS||'').split(',').map(s=>s.trim()).filter(Boolean);
+const SERVERDATA_AUTH=3,SERVERDATA_EXECCOMMAND=2;let reqId=1;
+function pkt(id,type,body){const b=Buffer.from(body,'utf8');const len=4+4+b.length+2;const buf=Buffer.alloc(4+len);buf.writeInt32LE(len,0);buf.writeInt32LE(id,4);buf.writeInt32LE(type,8);b.copy(buf,12);buf.writeInt8(0,12+b.length);buf.writeInt8(0,13+b.length);return buf;}
 function connect(){return new Promise((res,rej)=>{const s=net.createConnection({host:HOST,port:PORT},()=>res(s));s.setTimeout(TIMEOUT_MS,()=>{s.destroy(new Error('timeout'));});s.on('error',rej);});}
 async function auth(sock){return new Promise((res,rej)=>{const id=reqId++;sock.write(pkt(id,SERVERDATA_AUTH,PASS));let ok=false;const onData=(ch)=>{const rid=ch.readInt32LE(4);if(rid===-1){sock.off('data',onData);rej(new Error('auth failed'));}else{ok=true;sock.off('data',onData);res();}};sock.on('data',onData);setTimeout(()=>{if(!ok){sock.off('data',onData);rej(new Error('auth timeout'));}},TIMEOUT_MS);});}
 async function exec(sock,cmd){return new Promise((res)=>{sock.write(pkt(reqId++,SERVERDATA_EXECCOMMAND,cmd));setTimeout(res,200);});}
-(async()=>{if(CMDS.length===0)process.exit(0);const sock=await connect().catch(e=>{console.error('[rcon] connect failed:',e.message);process.exit(2);});try{await auth(sock);}catch(e){console.error('[rcon] auth failed:',e.message);sock.destroy();process.exit(3);}for(const c of CMDS){try{console.log('[rcon] cmd:',c);await exec(sock,c);}catch{}}try{sock.end();}catch{}setTimeout(()=>process.exit(0),50);})();
+(async()=>{if(CMDS.length===0)process.exit(0);const sock=await connect().catch(e=>{console.error("[rcon] connect failed:",e.message);process.exit(2);});try{await auth(sock);}catch(e){console.error("[rcon] auth failed:",e.message);sock.destroy();process.exit(3);}for(const c of CMDS){try{console.log("[rcon] cmd:",c);await exec(sock,c);}catch{}}try{sock.end();}catch{}setTimeout(()=>process.exit(0),50);})();
 __RCON_JS__
 }
 

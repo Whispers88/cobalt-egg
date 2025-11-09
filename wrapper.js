@@ -155,8 +155,11 @@ if (!executable) {
 }
 
 // minimal pretty “Executing …” line
-process.stdout.write(`${C.dim}${hhmm()}${C.reset} Executing: ${executable} ` +
-  params.map((a) => (/[^A-Za-z0-9_/.:-]/.test(a) ? `"${a}"` : a)).join(" ") + "\n");
+process.stdout.write(
+  `${C.dim}${hhmm()}${C.reset} Executing: ${executable} ` +
+  params.map((a) => (/[^A-Za-z0-9_/.:-]/.test(a) ? `"${a}"` : a)).join(" ") +
+  "\n"
+);
 
 // detect -logfile for mirroring
 let unityLogfile = null;
@@ -186,7 +189,7 @@ function emitPretty(sourceKey, chunk, isErr = false) {
       label === "[carbon]" ? C.fg.cyan :
       isErr ? C.fg.red : C.fg.green;
 
-    // hh:mm + optional tag, no [game]/[wrapper]
+    // hh:mm + optional tag
     const out = `${C.dim}${hhmm()}${C.reset} ${label ? label + " " : ""}${ln}`;
     (isErr ? process.stderr : process.stdout).write(`${color}${out}${C.reset}\n`);
   }
@@ -209,14 +212,13 @@ if (unityLogfile) {
   tailProc.stderr.on("data", tailMirror);
 }
 
-// signals: try graceful quit, then TERM
+// signals: try graceful quit, then TERM (typing "quit" in panel is preferred)
 let exited = false;
 ["SIGTERM", "SIGINT"].forEach((sig) => {
   process.on(sig, () => {
     if (!exited) {
       const line = `${C.dim}${hhmm()}${C.reset} stopping server...`;
       process.stdout.write(`${line}\n`);
-      try { /* when stdin is inherited, sending "quit\n" must be typed in panel */ } catch {}
       setTimeout(() => { try { game.kill("TERM"); } catch {} }, 5000);
     }
   });
@@ -226,7 +228,7 @@ game.on("exit", (code) => {
   exited = true;
   if (tailProc && !tailProc.killed) { try { tailProc.kill("TERM"); } catch {} }
 
-  // flush any trailing partial lines for visual completeness
+  // flush any trailing partial lines
   for (const k of Object.keys(buffers)) {
     const rem = buffers[k]; if (!rem) continue;
     const label = tagForLine(rem);
