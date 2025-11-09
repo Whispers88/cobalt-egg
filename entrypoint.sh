@@ -53,7 +53,7 @@ CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
-WATCH_ENABLED="${WATCH_ENABLED:-1}"
+WATCH_ENABLED="${WATCH_ENABLED:-1}"               # retained for messages; stall watch removed in exec mode
 HEARTBEAT_TIMEOUT_SEC="${HEARTBEAT_TIMEOUT_SEC:-120}"
 
 CHECK_EVERY_SEC=10
@@ -216,7 +216,7 @@ match_cron_field() {
     if [[ "$p" =~ ^([0-9]+)-([0-9]+)$ ]]; then
       [[ "$val" -ge "${BASH_REMATCH[1]}" && "$val" -le "${BASH_REMATCH[2]}" ]] && return 0
     elif [[ "$p" =~ ^\*/([0-9]+)$ ]]; then
-      (( val % ${BASH_REMATCH[1]} == 0 )) && return 0
+      (( val % ${BASHREMATCH[1]} == 0 )) && return 0
     elif [[ "$p" =~ ^[0-9]+$ ]]; then
       [[ "$val" -eq "$p" ]] && return 0
     fi
@@ -388,27 +388,6 @@ if [[ ! -f "./RustDedicated" ]]; then bad "RustDedicated not found. Enable VALID
 WRAPPER="/wrapper.js"; [[ -f "$WRAPPER" ]] || WRAPPER="/opt/cobalt/wrapper.js"
 [[ -f "$WRAPPER" ]] || { bad "wrapper.js not found at /wrapper.js or /opt/cobalt/wrapper.js"; exit 14; }
 
-# ---------------- CPU-only stall watch ----------------
-proc_ticks() { [[ -r "/proc/$1/stat" ]] || { echo 0; return; }; awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
-cpu_stall_watch() {
-  local pid="$1" last_ticks cur_ticks last_ts now_ts idle
-  last_ticks="$(proc_ticks "${pid}")"; last_ts="$(date +%s)"
-  echo -e "[watch] pid ${pid}, heartbeat=${HEARTBEAT_TIMEOUT_SEC}s, interval=${CHECK_EVERY_SEC}s"
-  trap 'exit 0' TERM INT
-  while kill -0 "${pid}" 2>/dev/null; do
-    sleep "${CHECK_EVERY_SEC}"; cur_ticks="$(proc_ticks "${pid}")"
-    if [[ "${cur_ticks}" != "${last_ticks}" && "${cur_ticks}" != "0" ]]; then last_ticks="${cur_ticks}"; last_ts="$(date +%s)"; continue; fi
-    now_ts="$(date +%s)"; idle=$(( now_ts - last_ts ))
-    if (( idle >= HEARTBEAT_TIMEOUT_SEC )); then
-      echo -e "${RED}[watch] stall: no CPU progress for ${idle}s (>= ${HEARTBEAT_TIMEOUT_SEC}s). TERM pid ${pid}${NC}"
-      kill -TERM "${pid}" 2>/dev/null || true
-      for (( i=0; i<STALL_TERM_GRACE_SEC; i++ )); do sleep 1; kill -0 "${pid}" 2>/dev/null || { echo "[watch] exited after TERM"; exit 0; }; done
-      echo -e "${RED}[watch] still running → KILL pid ${pid}${NC}"; kill -KILL "${pid}" 2>/dev/null || true; exit 0
-    fi
-  done
-  exit 0
-}
-
 # ---------------- RCON helper (shutdown/wipe) ----------------
 send_rcon_cmds() {
   local cmds_csv="$1"
@@ -424,71 +403,12 @@ const CMDS = (process.env.SHUTDOWN_RCON_CMDS || process.env.WIPE_RCON_CMDS || ''
 const SERVERDATA_AUTH = 3, SERVERDATA_EXECCOMMAND = 2; let reqId = 1;
 function pkt(id, type, body){const b=Buffer.from(body,'utf8');const len=4+4+b.length+2;const buf=Buffer.alloc(4+len);buf.writeInt32LE(len,0);buf.writeInt32LE(id,4);buf.writeInt32LE(type,8);b.copy(buf,12);buf.writeInt8(0,12+b.length);buf.writeInt8(0,13+b.length);return buf;}
 function connect(){return new Promise((res,rej)=>{const s=net.createConnection({host:HOST,port:PORT},()=>res(s));s.setTimeout(TIMEOUT_MS,()=>{s.destroy(new Error('timeout'));});s.on('error',rej);});}
-async function auth(sock){return new Promise((res,rej)=>{const id=reqId++;sock.write(pkt(id,SERVERDATA_AUTH,PASS));let ok=false;const onData=(ch)=>{const rid=ch.readInt32LE(4);if(rid===-1){sock.off('data',onData);rej(new Error('auth failed'));}else{ok=true;sock.off('data',onData);res();}};sock.on('data',onData);setTimeout(()=>{if(!ok){sock.off('data',onData);rej(new Error('auth timeout'));}},TIMEOUT_ms);});}
+async function auth(sock){return new Promise((res,rej)=>{const id=reqId++;sock.write(pkt(id,SERVERDATA_AUTH,PASS));let ok=false;const onData=(ch)=>{const rid=ch.readInt32LE(4);if(rid===-1){sock.off('data',onData);rej(new Error('auth failed'));}else{ok=true;sock.off('data',onData);res();}};sock.on('data',onData);setTimeout(()=>{if(!ok){sock.off('data',onData);rej(new Error('auth timeout'));}},TIMEOUT_MS);});}
 async function exec(sock,cmd){return new Promise((res)=>{sock.write(pkt(reqId++,SERVERDATA_EXECCOMMAND,cmd));setTimeout(res,200);});}
 (async()=>{if(CMDS.length===0)process.exit(0);const sock=await connect().catch(e=>{console.error('[rcon] connect failed:',e.message);process.exit(2);});try{await auth(sock);}catch(e){console.error('[rcon] auth failed:',e.message);sock.destroy();process.exit(3);}for(const c of CMDS){try{console.log('[rcon] cmd:',c);await exec(sock,c);}catch{}}try{sock.end();}catch{}setTimeout(()=>process.exit(0),50);})();
 __RCON_JS__
 }
 
-# ---------------- Shutdown hooks ----------------
-shutdown_ran="0"
-run_shutdown_cmds() {
-  [[ "${shutdown_ran}" == "1" ]] && return 0
-  shutdown_ran="1"
-  if [[ -n "${SHUTDOWN_RCON_CMDS// }" ]]; then
-    log "Sending shutdown RCON commands: ${SHUTDOWN_RCON_CMDS}"
-    send_rcon_cmds "${SHUTDOWN_RCON_CMDS}" || warn "Some RCON shutdown commands may have failed."
-    sleep 1
-  fi
-  if [[ -n "${SHUTDOWN_CMDS// }" ]]; then
-    log "Running local shutdown shell commands…"
-    local IFS=','; read -r -a CMDS <<< "${SHUTDOWN_CMDS}"
-    for raw in "${CMDS[@]}"; do
-      cmd="${raw#"${raw%%[![:space:]]*}"}"; cmd="${cmd%"${cmd##*[![:space:]]}"}"
-      [[ -z "${cmd}" ]] && continue
-      log "shutdown: ${cmd}"
-      timeout "${SHUTDOWN_TIMEOUT_SEC}" bash -lc "${cmd}" || warn "shutdown command failed or timed out (${SHUTDOWN_TIMEOUT_SEC}s): ${cmd}"
-    done
-  fi
-}
-
-# ---------------- Supervision loop (with stdin forwarding) ----------------
-child_pid=""; term_requested="0"
-trap 'term_requested="1"; [[ -n "${child_pid}" ]] && kill -TERM "${child_pid}" 2>/dev/null || true' TERM INT
-
-log "Launching via wrapper (argv mode) with stdin forwarding…"
-while :; do
-  /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}" &
-  child_pid="$!"
-
-  # Bridge panel stdin -> child stdin
-  if [[ -e "/proc/${child_pid}/fd/0" ]]; then
-    cat > "/proc/${child_pid}/fd/0" &
-    forward_pid="$!"
-  else
-    warn "Could not open /proc/${child_pid}/fd/0 for stdin forwarding."
-    forward_pid=""
-  fi
-
-  # Optional stall watch
-  if [[ "${WATCH_ENABLED}" == "1" ]]; then
-    cpu_stall_watch "${child_pid}" & stall_pid="$!"
-  fi
-
-  rc=0
-  wait "${child_pid}" || rc=$?
-
-  # Cleanup helpers
-  [[ -n "${stall_pid:-}" ]] && kill -TERM "${stall_pid}" 2>/dev/null || true
-  [[ -n "${forward_pid:-}" ]] && kill -TERM "${forward_pid}" 2>/dev/null || true
-
-  if [[ "${WATCH_ENABLED}" != "1" || "${rc}" -eq 0 || "${term_requested}" == "1" ]]; then
-    [[ "${rc}" -ne 0 ]] && make_crash_bundle
-    run_shutdown_cmds
-    exit "${rc}"
-  fi
-
-  warn "Server crashed/terminated (rc=${rc}). Restarting in ${RESTART_BACKOFF_SEC}s…"
-  make_crash_bundle
-  sleep "${RESTART_BACKOFF_SEC}"
-done
+# ---------------- Launch (wrapper is PID 1; inherits panel stdin) ----------------
+log "Launching via wrapper (argv mode)…"
+exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"

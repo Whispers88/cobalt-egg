@@ -192,7 +192,8 @@ function emitPretty(sourceKey, chunk, isErr = false) {
   }
 }
 
-const game = spawn(executable, params, { stdio: ["pipe", "pipe", "pipe"], cwd: "/home/container" });
+// NOTE: inherit stdin so panel input reaches the game directly
+const game = spawn(executable, params, { stdio: ["inherit", "pipe", "pipe"], cwd: "/home/container" });
 
 game.stdout.on("data", (d) => emitPretty("game", d, false));
 game.stderr.on("data", (d) => emitPretty("game", d, true));
@@ -208,17 +209,14 @@ if (unityLogfile) {
   tailProc.stderr.on("data", tailMirror);
 }
 
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (txt) => { try { game.stdin.write(txt); } catch {} });
-process.stdin.resume();
-
+// signals: try graceful quit, then TERM
 let exited = false;
 ["SIGTERM", "SIGINT"].forEach((sig) => {
   process.on(sig, () => {
     if (!exited) {
       const line = `${C.dim}${hhmm()}${C.reset} stopping server...`;
       process.stdout.write(`${line}\n`);
-      try { game.stdin.write("quit\n"); } catch {}
+      try { /* when stdin is inherited, sending "quit\n" must be typed in panel */ } catch {}
       setTimeout(() => { try { game.kill("TERM"); } catch {} }, 5000);
     }
   });
