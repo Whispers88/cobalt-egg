@@ -114,7 +114,6 @@ cgroup_cpu_quota() {
   if [[ -r /sys/fs/cgroup/cpu.max ]]; then
     awk '{ if ($1=="max") {print "unlimited"} else {printf("%.2f", $1/$2)} }' /sys/fs/cgroup/cpu.max
   elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
-    awk '{q=$0} END{;} ' /sys/fs/cgroup/cpu/cpu.cfs_quota_us >/dev/null 2>&1
     local q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
     local p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
     if (( q < 0 )); then echo "unlimited"; else awk -v q="$q" -v p="$p" 'BEGIN{printf("%.2f", q/p)}'; fi
@@ -180,7 +179,6 @@ oom_read_counter() {
   if [[ -r /sys/fs/cgroup/memory.events ]]; then
     awk '/oom_kill/ {print $2}' /sys/fs/cgroup/memory.events
   elif [[ -r /sys/fs/cgroup/memory/memory.oom_control ]]; then
-    # cgroup v1 lacks a counter; fallback: 0
     echo 0
   else
     echo 0
@@ -231,8 +229,8 @@ cron_matches_now() {
   nmin=$(date +%M); nhour=$(date +%H); ndom=$(date +%d); nmon=$(date +%m); ndow=$(date +%w)
   match_cron_field "$min" "$((10#$nmin))" && \
   match_cron_field "$hour" "$((10#$nhour))" && \
-  match_cron_field "$dom" "$((10#$ndom))" ) && \
-  match_cron_field "$mon" "$((10#$nmon))" ) && \
+  match_cron_field "$dom" "$((10#$ndom))" && \
+  match_cron_field "$mon" "$((10#$nmon))" && \
   match_cron_field "$dow" "$((10#$ndow))"
 }
 trigger_wipe() {
@@ -284,13 +282,31 @@ do_validate() {
   "$SCMD" +force_install_dir /home/container +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" +app_update "${SRCDS_APPID}" ${BRANCH_FLAGS} ${EXTRA_FLAGS} validate +quit
   good "Steam files validated."
 }
+
+# ---------------- Framework installers ----------------
 install_oxide() {
-  log "Installing Oxide (uMod)…"
+  # Accept: oxide, oxide-release, uMod (release) | oxide-staging (staging)
+  local channel="release"
+  case "${FRAMEWORK}" in
+    oxide-staging|uMod-staging|oxide_staging) channel="staging" ;;
+    *)                                         channel="release" ;;
+  esac
+
+  local url=""
+  if [[ "$channel" == "staging" ]]; then
+    url="https://downloads.oxidemod.com/artifacts/Oxide.Rust/staging/Oxide.Rust-linux.zip"
+  else
+    url="https://downloads.oxidemod.com/artifacts/Oxide.Rust/release/Oxide.Rust-linux.zip"
+  fi
+
+  log "Installing Oxide (channel: ${channel})…"
   local tmp; tmp="$(mktemp -d)"; pushd "$tmp" >/dev/null
-  curl -fSL --retry 5 -o oxide.zip "https://umod.org/games/rust/download?build=linux"
+  curl -fSL --retry 5 -o oxide.zip "${url}"
   unzip -o -q oxide.zip -d /home/container
-  popd >/dev/null; rm -rf "$tmp"; good "uMod install complete."
+  popd >/dev/null; rm -rf "$tmp"
+  good "Oxide install complete (${channel})."
 }
+
 install_carbon() {
   log "Installing Carbon…"
   local channel="production" minimal="0" url=""
@@ -325,6 +341,7 @@ install_carbon() {
   tar -xzf carbon.tar.gz -C /home/container
   popd >/dev/null; rm -rf "$tmp"; good "Carbon install complete."
 }
+
 install_from_custom_url() {
   local url="$1"; [[ -z "$url" ]] && { bad "Custom framework URL empty"; return 1; }
   log "Installing custom framework from URL…"
@@ -344,7 +361,7 @@ if [[ "${FRAMEWORK_UPDATE}" == "1" ]]; then
     install_from_custom_url "${CUSTOM_FRAMEWORK_URL}"
   else
     case "${FRAMEWORK}" in
-      oxide|uMod) install_oxide ;;
+      oxide|oxide-release|uMod|uMod-release|oxide-staging|uMod-staging) install_oxide ;;
       carbon*   ) install_carbon ;;
       *         ) log "Vanilla channel; no framework to install." ;;
     esac
@@ -407,7 +424,7 @@ const CMDS = (process.env.SHUTDOWN_RCON_CMDS || process.env.WIPE_RCON_CMDS || ''
 const SERVERDATA_AUTH = 3, SERVERDATA_EXECCOMMAND = 2; let reqId = 1;
 function pkt(id, type, body){const b=Buffer.from(body,'utf8');const len=4+4+b.length+2;const buf=Buffer.alloc(4+len);buf.writeInt32LE(len,0);buf.writeInt32LE(id,4);buf.writeInt32LE(type,8);b.copy(buf,12);buf.writeInt8(0,12+b.length);buf.writeInt8(0,13+b.length);return buf;}
 function connect(){return new Promise((res,rej)=>{const s=net.createConnection({host:HOST,port:PORT},()=>res(s));s.setTimeout(TIMEOUT_MS,()=>{s.destroy(new Error('timeout'));});s.on('error',rej);});}
-async function auth(sock){return new Promise((res,rej)=>{const id=reqId++;sock.write(pkt(id,SERVERDATA_AUTH,PASS));let ok=false;const onData=(ch)=>{const rid=ch.readInt32LE(4);if(rid===-1){sock.off('data',onData);rej(new Error('auth failed'));}else{ok=true;sock.off('data',onData);res();}};sock.on('data',onData);setTimeout(()=>{if(!ok){sock.off('data',onData);rej(new Error('auth timeout'));}},TIMEOUT_MS);});}
+async function auth(sock){return new Promise((res,rej)=>{const id=reqId++;sock.write(pkt(id,SERVERDATA_AUTH,PASS));let ok=false;const onData=(ch)=>{const rid=ch.readInt32LE(4);if(rid===-1){sock.off('data',onData);rej(new Error('auth failed'));}else{ok=true;sock.off('data',onData);res();}};sock.on('data',onData);setTimeout(()=>{if(!ok){sock.off('data',onData);rej(new Error('auth timeout'));}},TIMEOUT_ms);});}
 async function exec(sock,cmd){return new Promise((res)=>{sock.write(pkt(reqId++,SERVERDATA_EXECCOMMAND,cmd));setTimeout(res,200);});}
 (async()=>{if(CMDS.length===0)process.exit(0);const sock=await connect().catch(e=>{console.error('[rcon] connect failed:',e.message);process.exit(2);});try{await auth(sock);}catch(e){console.error('[rcon] auth failed:',e.message);sock.destroy();process.exit(3);}for(const c of CMDS){try{console.log('[rcon] cmd:',c);await exec(sock,c);}catch{}}try{sock.end();}catch{}setTimeout(()=>process.exit(0),50);})();
 __RCON_JS__
@@ -446,7 +463,6 @@ while :; do
 
   # Bridge panel stdin -> child stdin
   if [[ -e "/proc/${child_pid}/fd/0" ]]; then
-    # This background cat stays attached to PID 1 stdin; data is written to child's fd 0.
     cat > "/proc/${child_pid}/fd/0" &
     forward_pid="$!"
   else
