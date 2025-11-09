@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+# ---------- tiny logger ----------
 RED='\e[31m'; YEL='\e[33m'; GRN='\e[32m'; NC='\e[0m'
 log()  { echo -e "[entrypoint] $*"; }
 warn() { echo -e "${YEL}[warn]${NC} $*"; }
@@ -11,12 +12,12 @@ export HOME=/home/container
 cd /home/container || exit 1
 export TERM=${TERM:-xterm}
 
-# niceties
+# ---------- niceties ----------
 ulimit -n 65535 || true
 umask 002
 chown -R "$(id -u):$(id -g)" /home/container 2>/dev/null || true
 
-# SteamCMD layout
+# ---------- SteamCMD layout ----------
 mkdir -p /home/container/Steam/package /home/container/steamcmd /home/container/.steam/sdk32 /home/container/.steam/sdk64
 export STEAMCMDDIR=/home/container/steamcmd
 
@@ -26,7 +27,7 @@ steamcmd_path() {
   echo ""
 }
 
-# ---------------- Panel config ----------------
+# ---------- panel vars ----------
 SRCDS_APPID="${SRCDS_APPID:-258550}"
 
 STEAM_USER="${STEAM_USER:-anonymous}"
@@ -52,16 +53,15 @@ esac
 CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
-# RCON defaults (used only for optional shutdown helper if you wire it later)
+# RCON defaults (used by your wrapper & optional shutdown helpers)
 export RCON_HOST="${RCON_HOST:-127.0.0.1}"
 export RCON_PORT="${RCON_PORT:-28016}"
 export RCON_PASS="${RCON_PASS:-}"
 
-# (Removed: WATCH/HEARTBEAT/WRAPPER — no heartbeat or node wrapper)
+# ---------- (removed) heartbeat/watch ----------
+# No WATCH_ENABLED / HEARTBEAT_* / loops of any kind
 
-# Shutdown (single timeout, if you add a trap/RCON later)
-SHUTDOWN_CMDS="${SHUTDOWN_CMDS:-}"
-SHUTDOWN_RCON_CMDS="${SHUTDOWN_RCON_CMDS:-}"
+# Shutdown knobs (not used here directly; your wrapper may issue "quit")
 SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-30}"
 
 # Disk & limits awareness
@@ -73,10 +73,6 @@ HEAP_TARGET_MB="${HEAP_TARGET_MB:-}"
 OOM_WATCH="${OOM_WATCH:-1}"
 OOM_STATE_FILE="/home/container/.oom_seen"
 
-# Crash bundles
-CRASH_ARCHIVE="${CRASH_ARCHIVE:-1}"
-CRASH_PATH="${CRASH_PATH:-/crashdumps}"
-
 # Preflight port checks
 PREFLIGHT_PORTCHECK="${PREFLIGHT_PORTCHECK:-1}"
 
@@ -86,7 +82,7 @@ if [[ -z "${APP_PUBLIC_IP:-}" ]]; then
   export APP_PUBLIC_IP
 fi
 
-# ---------------- Limits awareness (red warnings) ----------------
+# ---------- limits awareness (red warnings) ----------
 cgroup_mem_limit_mb() {
   local lim
   if [[ -r /sys/fs/cgroup/memory.max ]]; then
@@ -121,7 +117,7 @@ if [[ "$MEM_LIMIT_MB" -gt 0 && "$MEM_LIMIT_MB" -lt 4096 ]]; then
   echo -e "${RED}[LIMIT] Low container memory (${MEM_LIMIT_MB}MB). Consider 6–8 GB for modded servers.${NC}"
 fi
 
-# ---------------- Disk-space guard ----------------
+# ---------- disk-space guard ----------
 free_mb=$(df -Pm /home/container | awk 'NR==2{print $4}')
 if (( free_mb < DISK_MIN_FREE_MB )); then
   echo -e "${RED}[DISK] Free space ${free_mb}MB < threshold ${DISK_MIN_FREE_MB}MB on /home/container${NC}"
@@ -135,7 +131,7 @@ else
   good "Disk free ${free_mb}MB ≥ ${DISK_MIN_FREE_MB}MB"
 fi
 
-# ---------------- Preflight port checks ----------------
+# ---------- preflight port checks ----------
 check_port() {
   local proto="$1" port="$2"
   if command -v ss >/dev/null 2>&1; then
@@ -164,7 +160,7 @@ if [[ "$PREFLIGHT_PORTCHECK" == "1" ]]; then
   fi
 fi
 
-# ---------------- OOM detector ----------------
+# ---------- OOM detector (notify only) ----------
 oom_read_counter() {
   if [[ -r /sys/fs/cgroup/memory.events ]]; then
     awk '/oom_kill/ {print $2}' /sys/fs/cgroup/memory.events
@@ -185,7 +181,7 @@ if [[ "$OOM_WATCH" == "1" ]]; then
   printf "%s" "$prev" > "$OOM_STATE_FILE" || true
 fi
 
-# ---------------- Validate / framework install ----------------
+# ---------- validate / framework install ----------
 do_validate() {
   [[ "${VALIDATE}" != "1" ]] && { log "VALIDATE=0 → skipping SteamCMD validation."; return 0; }
   local SCMD; SCMD="$(steamcmd_path)"
@@ -205,14 +201,12 @@ install_oxide() {
     oxide-staging|uMod-staging|oxide_staging) channel="staging" ;;
     *)                                         channel="release" ;;
   esac
-
   local url=""
   if [[ "$channel" == "staging" ]]; then
     url="https://downloads.oxidemod.com/artifacts/Oxide.Rust/staging/Oxide.Rust-linux.zip"
   else
     url="https://downloads.oxidemod.com/artifacts/Oxide.Rust/release/Oxide.Rust-linux.zip"
   fi
-
   log "Installing Oxide (channel: ${channel})…"
   local tmp; tmp="$(mktemp -d)"; pushd "$tmp" >/dev/null
   curl -fSL --retry 5 -o oxide.zip "${url}"
@@ -285,7 +279,7 @@ else
   do_validate
 fi
 
-# ---------------- Build argv ----------------
+# ---------- Build argv for wrapper ----------
 if [[ "$#" -gt 0 ]]; then
   ARGV=( "$@" )
 else
@@ -296,15 +290,19 @@ else
 fi
 if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then ARGV=( "${ARGV[@]:1}" ); fi
 
-# ---------------- Binary checks ----------------
+# ---------- binary checks ----------
 if [[ ! -f "./RustDedicated" ]]; then bad "RustDedicated not found. Enable VALIDATE=1 and retry."; exit 13; fi
 [[ -x "./RustDedicated" ]] || chmod +x ./RustDedicated || true
 
-# ---------------- Launch server directly with unbuffered output ----------------
-log "Launching RustDedicated (direct; line-buffered output)…"
+WRAPPER="/wrapper.js"; [[ -f "$WRAPPER" ]] || WRAPPER="/opt/cobalt/wrapper.js"
+[[ -f "$WRAPPER" ]] || { bad "wrapper.js not found at /wrapper.js or /opt/cobalt/wrapper.js"; exit 14; }
+
+# ---------- Launch wrapper as PID 1 with line-buffered output ----------
+log "Launching via wrapper (argv mode; no heartbeat)…"
 if command -v stdbuf >/dev/null 2>&1; then
-  exec stdbuf -oL -eL ./RustDedicated "${ARGV[@]}"
+  # Your JS expects: node wrapper.js --argv <RustDedicated> <args...>
+  exec stdbuf -oL -eL /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
 else
-  warn "stdbuf not found; logs may appear delayed. Install coreutils to improve."
-  exec ./RustDedicated "${ARGV[@]}"
+  warn "stdbuf not found; logs may be buffered. Install coreutils for best console output."
+  exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
 fi
