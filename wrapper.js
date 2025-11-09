@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 
 // ============================================================================
-// Rust wrapper — argv-safe + logfile mirroring + panel->RCON console shim
-// - Repairs split multi-word values (-flags and +commands)
+// Rust wrapper — argv-safe + logfile mirroring + panel->RCON/STDIN shim
 // - Pretty console with [oxide]/[carbon] tags
 // - Mirrors RAW to latest.log; tails -logfile if present
-// - NEW: panel input is sent to RCON. If RCON_PASS is missing, fallback to STDIN.
+// - Panel input:
+//     * "!" prefix => run as shell in container
+//     * "stdin:" prefix => send to Rust stdin
+//     * otherwise => send via RCON (if RCON_PASS set) or stdin fallback
+// - Now prints RCON response payloads
 // ============================================================================
 
 const { spawn } = require("child_process");
@@ -17,13 +20,14 @@ const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
 const RCON_HOST = process.env.RCON_HOST || "127.0.0.1";
 const RCON_PORT = parseInt(process.env.RCON_PORT || "28016", 10);
 const RCON_PASS = process.env.RCON_PASS || "";
-const CONSOLE_MODE = RCON_PASS ? "rcon" : "stdin"; // auto
+const CONSOLE_MODE = RCON_PASS ? "rcon" : "stdin"; // auto choose if no pass
 const COLOR_OK = process.stdout.isTTY && !("NO_COLOR" in process.env);
 
 // ---------- colors ----------
 const C = COLOR_OK
   ? { reset: "\x1b[0m", dim: "\x1b[2m",
-      fg: { red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m", cyan: "\x1b[36m", magenta: "\x1b[35m", white: "\x1b[37m" } }
+      fg: { red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
+            cyan: "\x1b[36m", magenta: "\x1b[35m", white: "\x1b[37m" } }
   : { reset: "", dim: "", fg: { red: "", green: "", yellow: "", cyan: "", magenta: "", white: "" } };
 
 // ---------- helpers ----------
@@ -71,8 +75,11 @@ params = repairSplitArgs(params);
 if(!executable){ console.error(`${hhmm()} ERROR: First argv element must be the RustDedicated binary.`); process.exit(1); }
 
 // ---------- run line ----------
-process.stdout.write(`${C.dim}${hhmm()}${C.reset} Executing: ${executable} ` +
-  params.map(a => (/[^A-Za-z0-9_/.:-]/.test(a)?`"${a}"`:a)).join(" ") + `  [console:${CONSOLE_MODE}]` + "\n");
+process.stdout.write(
+  `${C.dim}${hhmm()}${C.reset} Executing: ${executable} ` +
+  params.map(a => (/[^A-Za-z0-9_/.:-]/.test(a)?`"${a}"`:a)).join(" ") +
+  `  [console:${CONSOLE_MODE}]` + "\n"
+);
 
 // detect -logfile
 let unityLogfile = null;
@@ -84,10 +91,13 @@ function emitPretty(sourceKey, chunk, isErr=false){
   const key = sourceKey + (isErr?":err":":out");
   const prev = buffers[key] || "";
   const raw  = chunk.toString();
+
   try { fs.appendFile(LATEST_LOG, raw.replace(/\r/g,""), ()=>{}); } catch {}
+
   const s = prev + raw;
   const lines = s.split(/\r?\n/);
   buffers[key] = lines.pop();
+
   for(const ln of lines){
     const label = tagForLine(ln);
     const color = label==="[oxide]"?C.fg.magenta : label==="[carbon]"?C.fg.cyan : isErr?C.fg.red : C.fg.green;
@@ -96,7 +106,7 @@ function emitPretty(sourceKey, chunk, isErr=false){
   }
 }
 
-// ---------- spawn Rust (keep stdin PIPE; wrapper decides where panel input goes) ----------
+// ---------- spawn Rust ----------
 const game = spawn(executable, params, { stdio: ["pipe","pipe","pipe"], cwd: "/home/container" });
 game.stdout.on("data", d => emitPretty("game", d, false));
 game.stderr.on("data", d => emitPretty("game", d, true));
@@ -112,18 +122,14 @@ if(unityLogfile){
   tailProc.stderr.on("data", tailMirror);
 }
 
-// ---------- RCON shim ----------
+// ---------- RCON helpers ----------
 const SERVERDATA_AUTH=3, SERVERDATA_EXECCOMMAND=2;
 function pkt(id,type,body){
   const b=Buffer.from(String(body),"utf8");
   const len=4+4+b.length+2;
   const buf=Buffer.alloc(4+len);
-  buf.writeInt32LE(len,0);
-  buf.writeInt32LE(id,4);
-  buf.writeInt32LE(type,8);
-  b.copy(buf,12);
-  buf.writeInt8(0,12+b.length);
-  buf.writeInt8(0,13+b.length);
+  buf.writeInt32LE(len,0); buf.writeInt32LE(id,4); buf.writeInt32LE(type,8);
+  b.copy(buf,12); buf.writeInt8(0,12+b.length); buf.writeInt8(0,13+b.length);
   return buf;
 }
 function sendRconOnce(cmd){
@@ -132,32 +138,74 @@ function sendRconOnce(cmd){
       s.write(pkt(1,SERVERDATA_AUTH,RCON_PASS));
       setTimeout(()=>s.write(pkt(2,SERVERDATA_EXECCOMMAND,cmd)),150);
     });
-    let chunks=[];
+    const chunks=[];
     s.on("data",d=>chunks.push(d));
     s.on("error",e=>reject(e));
     s.setTimeout(4000,()=>{ try{s.destroy();}catch{} reject(new Error("rcon timeout")); });
-    setTimeout(()=>{ try{s.end();}catch{} resolve(Buffer.concat(chunks).toString("utf8")); },600);
+    setTimeout(()=>{ try{s.end();}catch{} resolve(Buffer.concat(chunks)); },650);
   });
+}
+function decodeRconBuffer(buf){
+  // Naive: try to locate UTF-8 text after header(s)
+  // Many servers echo back multiple packets; just strip non-printables and show text.
+  const txt = buf.toString("utf8").replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
+  return txt.trim();
 }
 
 // ---------- panel input handler ----------
+// Prefixes:
+//   "! <cmd>"     => shell in container
+//   "stdin: <x>"  => write to game stdin
+//   default       => RCON (if pass set) else stdin
 process.stdin.setEncoding("utf8");
 let stdinBuf="";
 process.stdin.on("data", (txt)=>{
   stdinBuf += txt;
   const lines = stdinBuf.split(/\r?\n/);
-  stdinBuf = lines.pop(); // keep partial
-  for(const lineRaw of lines){
-    const line = lineRaw.trim();
+  stdinBuf = lines.pop();
+  for(const rawLine of lines){
+    const line = rawLine.trim();
     if(!line) continue;
 
+    // Shell escape
+    if(line.startsWith("!")){
+      const sh = line.slice(1).trim();
+      if(!sh){ process.stdout.write(`${C.fg.yellow}${hhmm()} [shell] (empty)${C.reset}\n`); continue; }
+      process.stdout.write(`${C.dim}${hhmm()}${C.reset} [shell] ${sh}\n`);
+      const shProc = spawn("bash", ["-lc", sh], { stdio: ["ignore","pipe","pipe"] });
+      shProc.stdout.on("data", d => process.stdout.write(`${d}`));
+      shProc.stderr.on("data", d => process.stderr.write(`${d}`));
+      shProc.on("exit", code => process.stdout.write(`${C.dim}${hhmm()}${C.reset} [shell] exit ${code}\n`));
+      continue;
+    }
+
+    // Explicit stdin:
+    if(line.toLowerCase().startsWith("stdin:")){
+      const payload = line.slice(6).trimStart();
+      try { game.stdin.write(payload + "\n"); }
+      catch { process.stdout.write(`${C.fg.red}${hhmm()} [stdin] failed to write${C.reset}\n`); }
+      continue;
+    }
+
+    // Default path: RCON if possible, else stdin
     if(CONSOLE_MODE === "rcon"){
       sendRconOnce(line)
-        .then(() => process.stdout.write(`${C.dim}${hhmm()}${C.reset} [rcon] ${line}\n`))
+        .then(buf=>{
+          const body = decodeRconBuffer(buf);
+          if(body) {
+            // print each line nicely
+            for(const l of body.split(/\r?\n/)){
+              if(!l.trim()) continue;
+              process.stdout.write(`${C.dim}${hhmm()}${C.reset} [rcon] ${l}\n`);
+            }
+          } else {
+            process.stdout.write(`${C.dim}${hhmm()}${C.reset} [rcon] (no response)\n`);
+          }
+        })
         .catch(e => process.stdout.write(`${C.fg.red}${hhmm()} [rcon] ${line} -> ${e.message}${C.reset}\n`));
     } else {
       try { game.stdin.write(line + "\n"); }
-      catch { process.stdout.write(`${C.fg.red}${hhmm()} [stdin] failed to write command${C.reset}\n`); }
+      catch { process.stdout.write(`${C.fg.red}${hhmm()} [stdin] failed to write${C.reset}\n`); }
     }
   }
 });
