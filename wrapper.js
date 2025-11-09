@@ -1,19 +1,17 @@
 #!/usr/bin/env node
 
 // ============================================================================
-// Rust wrapper — argv-safe + logfile mirroring + panel->RCON/STDIN shim
-// - Pretty console with [oxide]/[carbon] tags
-// - Mirrors RAW to latest.log; tails -logfile if present
+// Rust wrapper — PTY-aware, argv-safe, logfile mirroring, panel->RCON/STDIN shim
+// - Prefers launching via `script -qefc` to give the game a PTY (so STDIN works)
+// - Uses `stdbuf -oL -eL` (if present) for line-buffered output
+// - Pretty console formatting; mirrors raw to latest.log; tails -logfile if present
 // - Panel input:
 //     * "! <cmd>"     => run shell in container
 //     * "stdin: <x>"  => send to Rust STDIN (console)
 //     * "console: <x>"=> alias of stdin
 //     * "rcon: <x>"   => send via RCON
-//     * default route => controlled by CONSOLE_MODE (stdin|rcon|auto)
-// - `.mode stdin|rcon|auto` at runtime switches default route
-// - Prints RCON response payloads
-// - NEW: runs the game via `stdbuf -oL -eL` for line-buffered output (if available)
-// - NEW: prints an ack when sending to STDIN so you see something immediately
+//     * default route => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
+// - `.mode stdin|rcon|auto` switches default at runtime
 // ============================================================================
 
 const { spawn, execSync } = require("child_process");
@@ -26,7 +24,6 @@ const RCON_HOST = process.env.RCON_HOST || "127.0.0.1";
 const RCON_PORT = parseInt(process.env.RCON_PORT || "28016", 10);
 const RCON_PASS = process.env.RCON_PASS || "";
 
-// Default routing: env wins; else "auto" (rcon if pass set; otherwise stdin)
 const initialMode = (process.env.CONSOLE_MODE || "auto").toLowerCase();
 const COLOR_OK = process.stdout.isTTY && !("NO_COLOR" in process.env);
 
@@ -42,6 +39,7 @@ const hhmm = () => { const d = new Date(); const p = n => String(n).padStart(2,"
 const looksLikeFlag = (s) => typeof s === "string" && /^[-+][A-Za-z0-9_.-]+$/.test(s);
 const SWITCH_ONLY = new Set(["-batchmode","-nographics","-nolog","-no-gui"]);
 const which = (bin) => { try { return execSync(`command -v ${bin}`, {stdio:["ignore","pipe","ignore"]}).toString().trim(); } catch { return ""; } };
+const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
 function repairSplitArgs(params){
   const out=[]; for(let i=0;i<params.length;){
@@ -121,19 +119,38 @@ function emitPretty(sourceKey, chunk, isErr=false){
   }
 }
 
-// ---------- spawn Rust (force line-buffer via stdbuf if available) ----------
-const stdbuf = which("stdbuf");
+// ---------- spawn Rust with PTY (script) + line buffer (stdbuf) ----------
+const scriptBin = which("script");     // from util-linux (required for PTY)
+const stdbufBin = which("stdbuf");     // from coreutils (nice-to-have)
+
 let cmd, args;
-if (stdbuf) {
-  cmd = stdbuf;
-  args = ["-oL", "-eL", executable, ...params];
-  process.stdout.write(`${C.dim}${hhmm()}${C.reset} using stdbuf for line-buffered output\n`);
+
+// Build the real command to run (optionally prefixed with stdbuf)
+const realCmd = (() => {
+  const seq = [];
+  if (stdbufBin) seq.push(stdbufBin, "-oL", "-eL");
+  seq.push(executable, ...params);
+  // Join safely for /bin/sh -c within 'script -c'
+  return seq.map(shQuote).join(" ");
+})();
+
+if (scriptBin) {
+  // Run under a PTY: script -qefc "<realCmd>" /dev/null
+  cmd = scriptBin;
+  args = ["-qefc", realCmd, "/dev/null"];
+  process.stdout.write(`${C.dim}${hhmm()}${C.reset} using PTY via 'script'${stdbufBin? " + stdbuf": ""}\n`);
 } else {
-  cmd = executable;
-  args = params;
-  process.stdout.write(`${C.dim}${hhmm()}${C.reset} stdbuf not found; output may be buffered\n`);
+  // Fallback (no PTY) — STDIN may not be consumed by Unity
+  if (stdbufBin) {
+    cmd = stdbufBin; args = ["-oL", "-eL", executable, ...params];
+    process.stdout.write(`${C.dim}${hhmm()}${C.reset} 'script' not found; running without PTY (using stdbuf)\n`);
+  } else {
+    cmd = executable; args = params;
+    process.stdout.write(`${C.dim}${hhmm()}${C.reset} 'script' & 'stdbuf' not found; running plain (STDIN may be ignored)\n`);
+  }
 }
-const game = spawn(cmd, args, { stdio: ["pipe","pipe","pipe"], cwd: "/home/container" });
+
+const game = spawn(cmd, args, { stdio: ["pipe","pipe","pipe"], cwd: "/home/container", shell: false });
 game.stdout.on("data", d => emitPretty("game", d, false));
 game.stderr.on("data", d => emitPretty("game", d, true));
 
@@ -179,12 +196,6 @@ function decodeRconBuffer(buf){
 }
 
 // ---------- panel input handler ----------
-// Prefixes:
-//   "! <cmd>"     => shell in container
-//   "stdin: <x>"  => write to game stdin
-//   "console: <x>"=> alias of stdin
-//   "rcon: <x>"   => send via rcon
-// Default is CONSOLE_MODE (stdin|rcon|auto), where auto = rcon if RCON_PASS else stdin
 process.stdin.setEncoding("utf8");
 let stdinBuf="";
 process.stdin.on("data", (txt)=>{
@@ -215,7 +226,7 @@ process.stdin.on("data", (txt)=>{
         process.env.CONSOLE_MODE = m;
         process.stdout.write(`${C.dim}${hhmm()}${C.reset} [mode] default set to ${m}\n`);
       } else {
-        process.stdout.write(`${C.dim}${hhmm()}${C.reset} [mode] use: .mode stdin | rcon | auto\n`);
+        process.stdout.write(`${C.dim}${hhmm()}${Creset} [mode] use: .mode stdin | rcon | auto\n`);
       }
       continue;
     }
@@ -257,13 +268,13 @@ process.stdin.on("data", (txt)=>{
           if(body) {
             for(const l of body.split(/\r?\n/)){
               if(!l.trim()) continue;
-              process.stdout.write(`${C.dim}${hhmm()}${C.reset} [rcon] ${l}\n`);
+              process.stdout.write(`${C.dim}${hhmm()}${Creset} [rcon] ${l}\n`);
             }
           } else {
             process.stdout.write(`${C.dim}${hhmm()}${C.reset} [rcon] (no response)\n`);
           }
         })
-        .catch(e => process.stdout.write(`${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${C.reset}\n`));
+        .catch(e => process.stdout.write(`${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${Creset}\n`));
     }
   }
 });
@@ -290,7 +301,7 @@ game.on("exit", (code)=>{
     const label=tagForLine(rem);
     const color=label==="[oxide]"?C.fg.magenta:label==="[carbon]"?C.fg.cyan:C.fg.white;
     const out=`${C.dim}${hhmm()}${C.reset} ${label?label+" ":""}${rem}`;
-    process.stdout.write(`${color}${out}${C.reset}\n`);
+    process.stdout.write(`${color}${out}${Creset}\n`);
     buffers[k]="";
   }
   const summary=`${C.dim}${hhmm()}${C.reset} exited with code: ${code}`;
