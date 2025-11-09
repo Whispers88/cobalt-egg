@@ -58,6 +58,11 @@ export RCON_HOST="${RCON_HOST:-127.0.0.1}"
 export RCON_PORT="${RCON_PORT:-28016}"
 export RCON_PASS="${RCON_PASS:-}"
 
+# ---------- force console-by-default for wrapper ----------
+# Options: stdin | rcon | auto    (auto = rcon if RCON_PASS set, else stdin)
+# We default to stdin so panel input goes to the game console unless overridden.
+export CONSOLE_MODE="${CONSOLE_MODE:-stdin}"
+
 # ---------- (removed) heartbeat/watch ----------
 # No WATCH_ENABLED / HEARTBEAT_* / loops of any kind
 
@@ -297,12 +302,17 @@ if [[ ! -f "./RustDedicated" ]]; then bad "RustDedicated not found. Enable VALID
 WRAPPER="/wrapper.js"; [[ -f "$WRAPPER" ]] || WRAPPER="/opt/cobalt/wrapper.js"
 [[ -f "$WRAPPER" ]] || { bad "wrapper.js not found at /wrapper.js or /opt/cobalt/wrapper.js"; exit 14; }
 
+# Pick a node binary (fallback to PATH if /opt/node not present)
+NODE_BIN="/opt/node/bin/node"
+command -v "$NODE_BIN" >/dev/null 2>&1 || NODE_BIN="$(command -v node || true)"
+[[ -n "$NODE_BIN" ]] || { bad "node binary not found"; exit 15; }
+
 # ---------- Launch wrapper as PID 1 with line-buffered output ----------
-log "Launching via wrapper (argv mode; no heartbeat)…"
+log "Launching via wrapper (argv mode; CONSOLE_MODE=${CONSOLE_MODE})"
 if command -v stdbuf >/dev/null 2>&1; then
   # Your JS expects: node wrapper.js --argv <RustDedicated> <args...>
-  exec stdbuf -oL -eL /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
+  exec stdbuf -oL -eL "$NODE_BIN" "$WRAPPER" --argv "${ARGV[@]}"
 else
   warn "stdbuf not found; logs may be buffered. Install coreutils for best console output."
-  exec /opt/node/bin/node "$WRAPPER" --argv "${ARGV[@]}"
+  exec "$NODE_BIN" "$WRAPPER" --argv "${ARGV[@]}"
 fi

@@ -5,10 +5,13 @@
 // - Pretty console with [oxide]/[carbon] tags
 // - Mirrors RAW to latest.log; tails -logfile if present
 // - Panel input:
-//     * "!" prefix => run as shell in container
-//     * "stdin:" prefix => send to Rust stdin
-//     * otherwise => send via RCON (if RCON_PASS set) or stdin fallback
-// - Now prints RCON response payloads
+//     * "! <cmd>"     => run shell in container
+//     * "stdin: <x>"  => send to Rust STDIN (console)
+//     * "console: <x>"=> alias of stdin:
+//     * "rcon: <x>"   => send via RCON
+//     * default route => controlled by CONSOLE_MODE (stdin|rcon|auto)
+// - `.mode stdin|rcon|auto` at runtime switches default route
+// - Prints RCON response payloads
 // ============================================================================
 
 const { spawn } = require("child_process");
@@ -20,7 +23,9 @@ const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
 const RCON_HOST = process.env.RCON_HOST || "127.0.0.1";
 const RCON_PORT = parseInt(process.env.RCON_PORT || "28016", 10);
 const RCON_PASS = process.env.RCON_PASS || "";
-const CONSOLE_MODE = RCON_PASS ? "rcon" : "stdin"; // auto choose if no pass
+
+// Default routing: env wins; else "auto" (rcon if pass set; otherwise stdin)
+const initialMode = (process.env.CONSOLE_MODE || "auto").toLowerCase();
 const COLOR_OK = process.stdout.isTTY && !("NO_COLOR" in process.env);
 
 // ---------- colors ----------
@@ -75,10 +80,17 @@ params = repairSplitArgs(params);
 if(!executable){ console.error(`${hhmm()} ERROR: First argv element must be the RustDedicated binary.`); process.exit(1); }
 
 // ---------- run line ----------
+const CONSOLE_MODE = (() => {
+  let m = initialMode;
+  if (m !== "stdin" && m !== "rcon" && m !== "auto") m = "auto";
+  return m;
+})();
+process.env.CONSOLE_MODE = CONSOLE_MODE;
+
 process.stdout.write(
   `${C.dim}${hhmm()}${C.reset} Executing: ${executable} ` +
   params.map(a => (/[^A-Za-z0-9_/.:-]/.test(a)?`"${a}"`:a)).join(" ") +
-  `  [console:${CONSOLE_MODE}]` + "\n"
+  `  [mode:${process.env.CONSOLE_MODE}]` + "\n"
 );
 
 // detect -logfile
@@ -146,8 +158,6 @@ function sendRconOnce(cmd){
   });
 }
 function decodeRconBuffer(buf){
-  // Naive: try to locate UTF-8 text after header(s)
-  // Many servers echo back multiple packets; just strip non-printables and show text.
   const txt = buf.toString("utf8").replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
   return txt.trim();
 }
@@ -156,18 +166,21 @@ function decodeRconBuffer(buf){
 // Prefixes:
 //   "! <cmd>"     => shell in container
 //   "stdin: <x>"  => write to game stdin
-//   default       => RCON (if pass set) else stdin
+//   "console: <x>"=> alias of stdin
+//   "rcon: <x>"   => send via rcon
+// Default is CONSOLE_MODE (stdin|rcon|auto), where auto = rcon if RCON_PASS else stdin
 process.stdin.setEncoding("utf8");
 let stdinBuf="";
 process.stdin.on("data", (txt)=>{
   stdinBuf += txt;
   const lines = stdinBuf.split(/\r?\n/);
   stdinBuf = lines.pop();
+
   for(const rawLine of lines){
     const line = rawLine.trim();
     if(!line) continue;
 
-    // Shell escape
+    // 1) Shell passthrough
     if(line.startsWith("!")){
       const sh = line.slice(1).trim();
       if(!sh){ process.stdout.write(`${C.fg.yellow}${hhmm()} [shell] (empty)${C.reset}\n`); continue; }
@@ -179,21 +192,49 @@ process.stdin.on("data", (txt)=>{
       continue;
     }
 
-    // Explicit stdin:
-    if(line.toLowerCase().startsWith("stdin:")){
-      const payload = line.slice(6).trimStart();
-      try { game.stdin.write(payload + "\n"); }
-      catch { process.stdout.write(`${C.fg.red}${hhmm()} [stdin] failed to write${C.reset}\n`); }
+    // 2) Runtime default mode toggle
+    if (line.toLowerCase().startsWith(".mode ")) {
+      const m = line.split(/\s+/,2)[1]?.toLowerCase();
+      if (m === "stdin" || m === "rcon" || m === "auto") {
+        process.env.CONSOLE_MODE = m;
+        process.stdout.write(`${C.dim}${hhmm()}${C.reset} [mode] default set to ${m}\n`);
+      } else {
+        process.stdout.write(`${C.dim}${hhmm()}${C.reset} [mode] use: .mode stdin | rcon | auto\n`);
+      }
       continue;
     }
 
-    // Default path: RCON if possible, else stdin
-    if(CONSOLE_MODE === "rcon"){
-      sendRconOnce(line)
+    // 3) Explicit routing prefixes
+    let route = (process.env.CONSOLE_MODE || "auto").toLowerCase();
+    let payload = line;
+
+    if (line.toLowerCase().startsWith("stdin:")) {
+      route = "stdin";
+      payload = line.slice(6).trimStart();
+    } else if (line.toLowerCase().startsWith("console:")) {
+      route = "stdin";
+      payload = line.slice(8).trimStart();
+    } else if (line.toLowerCase().startsWith("rcon:")) {
+      route = "rcon";
+      payload = line.slice(5).trimStart();
+    }
+
+    // 4) Resolve "auto" and missing RCON
+    if (route === "auto") route = (RCON_PASS ? "rcon" : "stdin");
+    if (route === "rcon" && !RCON_PASS) {
+      process.stdout.write(`${C.dim}${hhmm()}${C.reset} [rcon] disabled (no pass); using stdin\n`);
+      route = "stdin";
+    }
+
+    // 5) Dispatch
+    if (route === "stdin") {
+      try { game.stdin.write(payload + "\n"); }
+      catch { process.stdout.write(`${C.fg.red}${hhmm()} [stdin] failed to write${C.reset}\n`); }
+    } else {
+      sendRconOnce(payload)
         .then(buf=>{
           const body = decodeRconBuffer(buf);
           if(body) {
-            // print each line nicely
             for(const l of body.split(/\r?\n/)){
               if(!l.trim()) continue;
               process.stdout.write(`${C.dim}${hhmm()}${C.reset} [rcon] ${l}\n`);
@@ -202,10 +243,7 @@ process.stdin.on("data", (txt)=>{
             process.stdout.write(`${C.dim}${hhmm()}${C.reset} [rcon] (no response)\n`);
           }
         })
-        .catch(e => process.stdout.write(`${C.fg.red}${hhmm()} [rcon] ${line} -> ${e.message}${C.reset}\n`));
-    } else {
-      try { game.stdin.write(line + "\n"); }
-      catch { process.stdout.write(`${C.fg.red}${hhmm()} [stdin] failed to write${C.reset}\n`); }
+        .catch(e => process.stdout.write(`${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${C.reset}\n`));
     }
   }
 });
