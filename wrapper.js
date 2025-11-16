@@ -606,8 +606,7 @@ function ensureWebRconConnection() {
           const trimmed = ln.trim();
           if (!trimmed) continue;
 
-          // Ignore only lines that start with "[oxide]" (to avoid duplicates,
-          // since oxide already logs to main console)
+          // Ignore only lines that start with "[oxide]" (to avoid duplicates)
           if (trimmed.startsWith("[oxide]")) {
             continue;
           }
@@ -682,30 +681,37 @@ function sendRconOnce(cmdTxt) {
   return sendLegacyRconOnce(cmdTxt);
 }
 
-// ---------- Rust PID resolver for .stack ----------
+// ---------- Rust PID resolver for .stack (via /proc) ----------
 function resolveRustPid() {
-  // Prefer pgrep -f RustDedicated
   try {
-    const out = execSync("pgrep -f 'RustDedicated' || true", {
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .toString()
-      .trim();
+    const entries = fs.readdirSync("/proc", { withFileTypes: true });
+    const pids = [];
 
-    if (out) {
-      const candidates = out
-        .split(/\s+/)
-        .map((x) => parseInt(x, 10))
-        .filter((n) => Number.isFinite(n) && n > 1);
-      if (candidates.length) return candidates[0];
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      const name = ent.name;
+      if (!/^\d+$/.test(name)) continue;
+
+      const pid = parseInt(name, 10);
+      if (!Number.isFinite(pid) || pid <= 1) continue;
+
+      try {
+        const commPath = `/proc/${pid}/comm`;
+        const comm = fs.readFileSync(commPath, "utf8").trim();
+        if (comm === "RustDedicated") {
+          pids.push(pid);
+        }
+      } catch {
+        // ignore races / permission issues
+      }
+    }
+
+    if (pids.length) {
+      pids.sort((a, b) => a - b);
+      return pids[0]; // lowest PID RustDedicated
     }
   } catch {
-    // ignore and fall through
-  }
-
-  // Fallback: if our child is directly RustDedicated
-  if (game && !game.killed && game.pid && Number.isFinite(game.pid)) {
-    return game.pid;
+    // ignore
   }
 
   return null;
