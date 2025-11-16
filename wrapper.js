@@ -682,10 +682,12 @@ function sendRconOnce(cmdTxt) {
 }
 
 // ---------- Rust PID resolver for .stack (via /proc) ----------
+// ---------- Rust PID resolver for .stack (via /proc/exe) ----------
 function resolveRustPid() {
+  let bestPid = null;
+
   try {
     const entries = fs.readdirSync("/proc", { withFileTypes: true });
-    const pids = [];
 
     for (const ent of entries) {
       if (!ent.isDirectory()) continue;
@@ -696,26 +698,64 @@ function resolveRustPid() {
       if (!Number.isFinite(pid) || pid <= 1) continue;
 
       try {
-        const commPath = `/proc/${pid}/comm`;
-        const comm = fs.readFileSync(commPath, "utf8").trim();
-        if (comm === "RustDedicated") {
-          pids.push(pid);
+        // Most reliable: look at the actual executable symlink.
+        const exeTarget = fs.readlinkSync(`/proc/${pid}/exe`);
+        if (!exeTarget) continue;
+
+        const base = exeTarget.split("/").pop() || "";
+        const lower = base.toLowerCase();
+
+        // Rust Linux binary is usually "RustDedicated" or very close.
+        if (lower.startsWith("rustdedicated")) {
+          // keep the lowest PID we see (oldest Rust process)
+          if (bestPid === null || pid < bestPid) {
+            bestPid = pid;
+          }
+          continue;
+        }
+
+        // Fallback: if exe name didn't match, you can also try comm/cmdline
+        // in case of weird launch wrappers or renamed binaries.
+        let matched = false;
+
+        try {
+          const comm = fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+          if (comm.toLowerCase().startsWith("rustdedicated")) {
+            matched = true;
+          }
+        } catch {
+          // ignore
+        }
+
+        if (!matched) {
+          try {
+            const cmdline = fs
+              .readFileSync(`/proc/${pid}/cmdline`)
+              .toString("utf8");
+            if (cmdline.toLowerCase().includes("rustdedicated")) {
+              matched = true;
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        if (matched) {
+          if (bestPid === null || pid < bestPid) {
+            bestPid = pid;
+          }
         }
       } catch {
-        // ignore races / permission issues
+        // process might have died or be inaccessible; ignore and continue
       }
     }
-
-    if (pids.length) {
-      pids.sort((a, b) => a - b);
-      return pids[0]; // lowest PID RustDedicated
-    }
   } catch {
-    // ignore
+    // /proc not accessible or something very odd
   }
 
-  return null;
+  return bestPid;
 }
+
 
 // ---------- panel input handler ----------
 process.stdin.setEncoding("utf8");
