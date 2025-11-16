@@ -613,85 +613,68 @@ function sendRconOnce(cmdTxt) {
   return sendLegacyRconOnce(cmdTxt);
 }
 
-// ---------- resolve RustDedicated PID (for .stack / .telemetry) ----------
+// ---------- resolve RustDedicated PID via /proc tree ----------
 function resolveRustPid(callback) {
   if (!game || game.killed) {
     callback(null);
     return;
   }
 
-  // If we're *not* going through `script`, game.pid is RustDedicated.
+  // If we *didn't* go through script(1), the wrapper child *is* RustDedicated.
   if (!scriptBin || forcePlainStdin) {
     callback(game.pid);
     return;
   }
 
-  // Try pgrep first
-  const tryPgrep = () => {
-    const ps = spawn("pgrep", ["-f", "RustDedicated"], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  const rootPid = game.pid;
+  const visited = new Set();
 
-    let out = "";
-    ps.stdout.on("data", (d) => (out += d.toString()));
+  function walk(pid) {
+    if (!pid || visited.has(pid)) return false;
+    visited.add(pid);
 
-    ps.on("exit", (code) => {
-      if (code !== 0 || !out.trim()) {
-        // fallback to ps/grep
-        tryPsGrep();
-        return;
-      }
-      const tokens = out.trim().split(/\s+/);
-      const pidStr = tokens[tokens.length - 1];
-      const pid = parseInt(pidStr, 10);
-      if (!pid || Number.isNaN(pid)) {
-        tryPsGrep();
-      } else {
-        callback(pid);
-      }
-    });
+    let comm = "";
+    try {
+      comm = fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    } catch {
+      // process might have exited between scans
+    }
 
-    ps.on("error", () => {
-      // pgrep not available → fallback
-      tryPsGrep();
-    });
-  };
+    if (comm && /RustDedicated/i.test(comm)) {
+      callback(pid);
+      return true;
+    }
 
-  const tryPsGrep = () => {
-    const finder = spawn(
-      "sh",
-      [
-        "-lc",
-        "ps -eo pid,args | grep -i 'RustDedicated' | grep -v grep | awk '{print $1}'",
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-
-    let out = "";
-    finder.stdout.on("data", (d) => (out += d.toString()));
-
-    finder.on("exit", () => {
-      const pidStr = out.trim().split(/\s+/)[0] || "";
-      const pid = parseInt(pidStr, 10);
-      if (!pid || Number.isNaN(pid)) {
-        process.stdout.write(
-          `${C.fg.red}${hhmm()} [stack] could not find RustDedicated via ps/pgrep${C.reset}\n`,
-        );
-        callback(null);
-      } else {
-        callback(pid);
-      }
-    });
-
-    finder.on("error", () => {
-      process.stdout.write(
-        `${C.fg.red}${hhmm()} [stack] ps/grep lookup failed${C.reset}\n`,
+    // look at children of this pid
+    let children = "";
+    try {
+      children = fs.readFileSync(
+        `/proc/${pid}/task/${pid}/children`,
+        "utf8",
       );
-      callback(null);
-    });
-  };
+    } catch {
+      children = "";
+    }
 
-  tryPgrep();
+    const ids = children
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((x) => parseInt(x, 10))
+      .filter((x) => !Number.isNaN(x));
+
+    for (const child of ids) {
+      if (walk(child)) return true;
+    }
+    return false;
+  }
+
+  if (!walk(rootPid)) {
+    process.stdout.write(
+      `${C.fg.red}${hhmm()} [stack] could not find RustDedicated via /proc tree (root pid ${rootPid})${C.reset}\n`,
+    );
+    callback(null);
+  }
 }
 
 // ---------- panel input handler ----------
@@ -773,7 +756,7 @@ process.stdin.on("data", (txt) => {
         bt.stdout.on("data", (d) => {
           const text = d.toString();
           process.stdout.write(
-            `${C.dim}${hhmm()}${C.reset} [gdb] ${text}`,
+            `${C.dim}${hhmm()}${Creset} [gdb] ${text}`,
           );
         });
 
@@ -862,7 +845,7 @@ process.stdin.on("data", (txt) => {
 
         ps.on("error", (e) => {
           process.stdout.write(
-            `${C.fg.red}${hhmm()} [telemetry] ps error: ${e.message}${C.reset}\n`,
+            `${C.fg.red}${hhmm()} [telemetry] ps error: ${e.message}${Creset}\n`,
           );
         });
       });
@@ -910,7 +893,7 @@ process.stdin.on("data", (txt) => {
       // route === "rcon"
       sendRconOnce(payload).catch((e) => {
         process.stdout.write(
-          `${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${C.reset}\n`,
+          `${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${Creset}\n`,
         );
       });
     }
@@ -958,14 +941,14 @@ game.on("exit", (code) => {
         : label === "[carbon]"
           ? C.fg.cyan
           : C.fg.white;
-    const out = `${C.dim}${hhmm()}${C.reset} ${
+    const out = `${C.dim}${hhmm()}${Creset} ${
       label ? label + " " : ""
     }${rem}`;
-    process.stdout.write(`${color}${out}${C.reset}\n`);
+    process.stdout.write(`${color}${out}${Creset}\n`);
     buffers[k] = "";
   }
 
-  const summary = `${C.dim}${hhmm()}${C.reset} exited with code: ${code}`;
+  const summary = `${C.dim}${hhmm()}${Creset} exited with code: ${code}`;
   process.stdout.write(`${summary}\n`);
   process.exit(code ?? 0);
 });
