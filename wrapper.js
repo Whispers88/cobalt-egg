@@ -12,7 +12,7 @@
 //     * "console: <x>" => alias of stdin
 //     * "rcon: <x>"    => send via RCON (legacy or Web, based on RCON_MODE)
 //     * default route  => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
-//     * ".stack"       => send SIGQUIT to RustDedicated for stack dump
+//     * ".stack"       => use gdb to pause RustDedicated, dump backtraces, resume
 // - `.mode stdin|rcon|auto` switches default at runtime
 // - RCON_MODE=legacy|web selects legacy RCON or WebRCON
 // ============================================================================
@@ -26,7 +26,7 @@ let WebSocket = null;
 try {
   WebSocket = require("ws");
 } catch {
-  // ok; only needed if RCON_MODE=web
+  // only required for RCON_MODE=web
 }
 
 // ---------- config ----------
@@ -327,7 +327,7 @@ if (scriptBin && !forcePlainStdin) {
   cmd = executable;
   args = params;
   process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} running plain (no script, no stdbuf)\n`,
+    `${C.dim}${hhmm()}${Creset} running plain (no script, no stdbuf)\n`,
   );
 }
 
@@ -414,7 +414,7 @@ function ensureLegacyRconConnection() {
     rconSocket = socket;
     rconReady = false;
 
-    socket.on("data", (d) => {
+    socket.on("data", () => {
       if (!rconReady) {
         rconReady = true;
         process.stdout.write(
@@ -522,7 +522,7 @@ function ensureWebRconConnection() {
 
     ws.on("close", () => {
       process.stdout.write(
-        `${C.dim}${hhmm()}${C.reset} [rcon] WebRCON closed\n`,
+        `${C.dim}${hhmm()}${Creset} [rcon] WebRCON closed\n`,
       );
       webRconReady = false;
       webRconSocket = null;
@@ -627,24 +627,46 @@ process.stdin.on("data", (txt) => {
       continue;
     }
 
-    // 2b) Stack trace request
+    // 2b) Stack trace request via gdb (pause, dump, resume)
     if (line.toLowerCase() === ".stack") {
-      if (game && !game.killed) {
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [stack] sending SIGQUIT to RustDedicated\n`,
-        );
-        try {
-          game.kill("SIGQUIT");
-        } catch (e) {
-          process.stdout.write(
-            `${C.fg.red}${hhmm()} [stack] failed to send SIGQUIT: ${e.message}${C.reset}\n`,
-          );
-        }
-      } else {
+      if (!game || game.killed) {
         process.stdout.write(
           `${C.fg.red}${hhmm()} [stack] game process not running${C.reset}\n`,
         );
+        continue;
       }
+
+      const pid = game.pid;
+      process.stdout.write(
+        `${C.dim}${hhmm()}${C.reset} [stack] running gdb backtrace on pid ${pid}\n`,
+      );
+
+      const bt = spawn(
+        "gdb",
+        ["-batch", "-ex", "thread apply all bt", "-p", String(pid)],
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+
+      bt.stdout.on("data", (d) => {
+        process.stdout.write(
+          `${C.dim}${hhmm()}${C.reset} [gdb] ${d.toString()}`,
+        );
+      });
+
+      bt.stderr.on("data", (d) => {
+        process.stdout.write(
+          `${C.fg.red}${hhmm()} [gdb] ${d.toString()}${C.reset}`,
+        );
+      });
+
+      bt.on("exit", (code) => {
+        process.stdout.write(
+          `${C.dim}${hhmm()}${C.reset} [stack] gdb exited with code ${code}\n`,
+        );
+      });
+
       continue;
     }
 
@@ -677,7 +699,7 @@ process.stdin.on("data", (txt) => {
       try {
         game.stdin.write(payload + "\n");
         process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [stdin] ${payload}\n`,
+          `${C.dim}${hhmm()}${Creset} [stdin] ${payload}\n`,
         );
       } catch {
         process.stdout.write(
