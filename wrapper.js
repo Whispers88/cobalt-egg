@@ -533,8 +533,15 @@ function ensureWebRconConnection() {
         payload = payload.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
         const lines = payload.split(/\r?\n/);
 
-        for (const ln of lines) {
-          if (!ln.trim()) continue;
+         for (const ln of lines) {
+          const trimmed = ln.trim();
+          if (!trimmed) continue;
+
+          // Ignore only lines that start with "[oxide]"
+          if (trimmed.startsWith("[oxide]")) {
+            continue;
+          }
+
           const out = `${C.dim}${hhmm()}${C.reset} [rcon] ${ln}`;
           // Pick a color you like; cyan is a nice "remote" hint
           process.stdout.write(`${C.fg.cyan}${out}${C.reset}\n`);
@@ -544,7 +551,7 @@ function ensureWebRconConnection() {
           `${C.fg.red}${hhmm()} [rcon] WebRCON message decode error: ${e.message}${C.reset}\n`,
         );
       }
-    });
+  });
 
 
     ws.on("error", (e) => {
