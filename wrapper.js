@@ -12,7 +12,7 @@
 //     * "console: <x>" => alias of stdin
 //     * "rcon: <x>"    => send via RCON (legacy or Web, based on RCON_MODE)
 //     * default route  => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
-//     * ".stack"       => use gdb to dump backtraces of RustDedicated
+//     * ".stack"       => use gdb to pause RustDedicated, dump backtraces, resume
 // - `.mode stdin|rcon|auto` switches default at runtime
 // - RCON_MODE=legacy|web selects legacy RCON or WebRCON
 // ============================================================================
@@ -114,10 +114,6 @@ function tagForLine(s) {
   if (t.includes("oxide") || t.includes("umod")) return "[oxide]";
   if (t.includes("carbon")) return "[carbon]";
   return "";
-}
-
-function mb(bytes) {
-  return (bytes / 1024 / 1024).toFixed(1);
 }
 
 // ---------- log file setup ----------
@@ -366,6 +362,45 @@ if (unityLogfile) {
   );
 }
 
+// ---------- helper to resolve actual RustDedicated PID ----------
+function resolveRustPid(callback) {
+  if (!game || game.killed) {
+    callback(null);
+    return;
+  }
+
+  // If we're *not* going through `script`, game.pid is RustDedicated.
+  if (!scriptBin || forcePlainStdin) {
+    callback(game.pid);
+    return;
+  }
+
+  // Otherwise, find RustDedicated via pgrep.
+  const ps = spawn("pgrep", ["-f", "RustDedicated"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let out = "";
+  ps.stdout.on("data", (d) => (out += d.toString()));
+
+  ps.on("exit", (code) => {
+    if (code !== 0) {
+      callback(null);
+      return;
+    }
+    const tokens = out.trim().split(/\s+/);
+    const pidStr = tokens[tokens.length - 1];
+    const pid = parseInt(pidStr, 10);
+    if (!pid || Number.isNaN(pid)) {
+      callback(null);
+    } else {
+      callback(pid);
+    }
+  });
+
+  ps.on("error", () => callback(null));
+}
+
 // ---------- RCON helpers (persistent; legacy + optional WebRCON) ----------
 const SERVERDATA_AUTH = 3;
 const SERVERDATA_EXECCOMMAND = 2;
@@ -541,12 +576,12 @@ function ensureWebRconConnection() {
           const trimmed = ln.trim();
           if (!trimmed) continue;
 
-          // Ignore only lines that start with "[oxide]" (we already see them via console)
+          // Ignore only lines that start with "[oxide]" (oxide already logs to console)
           if (trimmed.startsWith("[oxide]")) {
             continue;
           }
 
-          const out = `${C.dim}${hhmm()}${C.reset} [rcon] ${trimmed}`;
+          const out = `${C.dim}${hhmm()}${C.reset} [rcon] ${ln}`;
           process.stdout.write(`${C.fg.cyan}${out}${C.reset}\n`);
         }
       } catch (e) {
@@ -617,48 +652,6 @@ function sendRconOnce(cmdTxt) {
   return sendLegacyRconOnce(cmdTxt);
 }
 
-// ---------- telemetry: memory + CPU sampler (optional) ----------
-const TELEMETRY_INTERVAL_SEC = parseInt(
-  process.env.TELEMETRY_INTERVAL_SEC || "0",
-  10,
-);
-
-if (TELEMETRY_INTERVAL_SEC > 0) {
-  let lastCpu = process.cpuUsage();
-  let lastHr = process.hrtime(); // [seconds, nanoseconds]
-
-  setInterval(() => {
-    try {
-      const mem = process.memoryUsage();
-      const cpuDiff = process.cpuUsage(lastCpu);
-      const hrDiff = process.hrtime(lastHr);
-
-      // elapsed wall time in ms
-      const elapsedMs = hrDiff[0] * 1000 + hrDiff[1] / 1e6;
-      // CPU time in ms (user + system)
-      const cpuMs = (cpuDiff.user + cpuDiff.system) / 1000;
-      const cpuPct = elapsedMs > 0 ? (cpuMs / elapsedMs) * 100 : 0;
-
-      lastCpu = process.cpuUsage();
-      lastHr = process.hrtime();
-
-      const line =
-        `${C.dim}${hhmm()}${C.reset} ` +
-        `[telemetry] rss=${mb(mem.rss)}MB ` +
-        `heapUsed=${mb(mem.heapUsed)}MB ` +
-        `external=${mb(mem.external)}MB ` +
-        `cpu=${cpuPct.toFixed(1)}%`;
-
-      process.stdout.write(`${C.fg.yellow}${line}${C.reset}\n`);
-    } catch (e) {
-      const errLine =
-        `${C.dim}${hhmm()}${C.reset} ` +
-        `[telemetry] error: ${e.message || e}`;
-      process.stdout.write(`${C.fg.red}${errLine}${C.reset}\n`);
-    }
-  }, TELEMETRY_INTERVAL_SEC * 1000).unref();
-}
-
 // ---------- panel input handler ----------
 process.stdin.setEncoding("utf8");
 let stdinBuf = "";
@@ -713,44 +706,55 @@ process.stdin.on("data", (txt) => {
       continue;
     }
 
-    // 2b) Stack trace request via gdb (pause, dump, resume)
+    // 2b) Stack trace request via gdb (pause, dump, resume) on real RustDedicated PID
     if (line.toLowerCase() === ".stack") {
-      if (!game || game.killed) {
+      resolveRustPid((pid) => {
+        if (!pid) {
+          process.stdout.write(
+            `${C.fg.red}${hhmm()} [stack] could not resolve RustDedicated PID (is the server running?)${C.reset}\n`,
+          );
+          return;
+        }
+
         process.stdout.write(
-          `${C.fg.red}${hhmm()} [stack] game process not running${C.reset}\n`,
+          `${C.dim}${hhmm()}${C.reset} [stack] running gdb backtrace on pid ${pid}\n`,
         );
-        continue;
-      }
 
-      const pid = game.pid;
-      process.stdout.write(
-        `${C.dim}${hhmm()}${C.reset} [stack] running gdb backtrace on pid ${pid}\n`,
-      );
-
-      const bt = spawn(
-        "gdb",
-        ["-batch", "-ex", "thread apply all bt", "-p", String(pid)],
-        {
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
-
-      bt.stdout.on("data", (d) => {
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [gdb] ${d.toString()}`,
+        const bt = spawn(
+          "gdb",
+          ["-batch", "-ex", "thread apply all bt", "-p", String(pid)],
+          {
+            stdio: ["ignore", "pipe", "pipe"],
+          },
         );
-      });
 
-      bt.stderr.on("data", (d) => {
-        process.stdout.write(
-          `${C.fg.red}${hhmm()} [gdb] ${d.toString()}${C.reset}`,
-        );
-      });
+        let stderrBuf = "";
 
-      bt.on("exit", (code) => {
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [stack] gdb exited with code ${code}\n`,
-        );
+        bt.stdout.on("data", (d) => {
+          process.stdout.write(
+            `${C.dim}${hhmm()}${C.reset} [gdb] ${d.toString()}`,
+          );
+        });
+
+        bt.stderr.on("data", (d) => {
+          const s = d.toString();
+          stderrBuf += s;
+          process.stdout.write(
+            `${C.fg.red}${hhmm()} [gdb] ${s}${C.reset}`,
+          );
+        });
+
+        bt.on("exit", (code) => {
+          if (/Operation not permitted/.test(stderrBuf)) {
+            process.stdout.write(
+              `${C.fg.red}${hhmm()} [stack] gdb could not attach (ptrace blocked by host/container security).${C.reset}\n`,
+            );
+          } else {
+            process.stdout.write(
+              `${C.dim}${hhmm()}${C.reset} [stack] gdb exited with code ${code}\n`,
+            );
+          }
+        });
       });
 
       continue;
