@@ -12,7 +12,7 @@
 //     * "console: <x>" => alias of stdin
 //     * "rcon: <x>"    => send via RCON (legacy or Web, based on RCON_MODE)
 //     * default route  => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
-//     * ".stack"       => use gdb to pause RustDedicated, dump backtraces, resume
+//     * ".stack"       => use gdb to dump backtraces of RustDedicated
 // - `.mode stdin|rcon|auto` switches default at runtime
 // - RCON_MODE=legacy|web selects legacy RCON or WebRCON
 // ============================================================================
@@ -114,6 +114,10 @@ function tagForLine(s) {
   if (t.includes("oxide") || t.includes("umod")) return "[oxide]";
   if (t.includes("carbon")) return "[carbon]";
   return "";
+}
+
+function mb(bytes) {
+  return (bytes / 1024 / 1024).toFixed(1);
 }
 
 // ---------- log file setup ----------
@@ -327,7 +331,7 @@ if (scriptBin && !forcePlainStdin) {
   cmd = executable;
   args = params;
   process.stdout.write(
-    `${C.dim}${hhmm()}${Creset} running plain (no script, no stdbuf)\n`,
+    `${C.dim}${hhmm()}${C.reset} running plain (no script, no stdbuf)\n`,
   );
 }
 
@@ -533,17 +537,16 @@ function ensureWebRconConnection() {
         payload = payload.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
         const lines = payload.split(/\r?\n/);
 
-         for (const ln of lines) {
+        for (const ln of lines) {
           const trimmed = ln.trim();
           if (!trimmed) continue;
 
-          // Ignore only lines that start with "[oxide]"
+          // Ignore only lines that start with "[oxide]" (we already see them via console)
           if (trimmed.startsWith("[oxide]")) {
             continue;
           }
 
-          const out = `${C.dim}${hhmm()}${C.reset} [rcon] ${ln}`;
-          // Pick a color you like; cyan is a nice "remote" hint
+          const out = `${C.dim}${hhmm()}${C.reset} [rcon] ${trimmed}`;
           process.stdout.write(`${C.fg.cyan}${out}${C.reset}\n`);
         }
       } catch (e) {
@@ -551,8 +554,7 @@ function ensureWebRconConnection() {
           `${C.fg.red}${hhmm()} [rcon] WebRCON message decode error: ${e.message}${C.reset}\n`,
         );
       }
-  });
-
+    });
 
     ws.on("error", (e) => {
       process.stdout.write(
@@ -564,7 +566,7 @@ function ensureWebRconConnection() {
 
     ws.on("close", () => {
       process.stdout.write(
-        `${C.dim}${hhmm()}${Creset} [rcon] WebRCON closed\n`,
+        `${C.dim}${hhmm()}${C.reset} [rcon] WebRCON closed\n`,
       );
       webRconReady = false;
       webRconSocket = null;
@@ -613,6 +615,48 @@ function sendRconOnce(cmdTxt) {
 
   // default: legacy
   return sendLegacyRconOnce(cmdTxt);
+}
+
+// ---------- telemetry: memory + CPU sampler (optional) ----------
+const TELEMETRY_INTERVAL_SEC = parseInt(
+  process.env.TELEMETRY_INTERVAL_SEC || "0",
+  10,
+);
+
+if (TELEMETRY_INTERVAL_SEC > 0) {
+  let lastCpu = process.cpuUsage();
+  let lastHr = process.hrtime(); // [seconds, nanoseconds]
+
+  setInterval(() => {
+    try {
+      const mem = process.memoryUsage();
+      const cpuDiff = process.cpuUsage(lastCpu);
+      const hrDiff = process.hrtime(lastHr);
+
+      // elapsed wall time in ms
+      const elapsedMs = hrDiff[0] * 1000 + hrDiff[1] / 1e6;
+      // CPU time in ms (user + system)
+      const cpuMs = (cpuDiff.user + cpuDiff.system) / 1000;
+      const cpuPct = elapsedMs > 0 ? (cpuMs / elapsedMs) * 100 : 0;
+
+      lastCpu = process.cpuUsage();
+      lastHr = process.hrtime();
+
+      const line =
+        `${C.dim}${hhmm()}${C.reset} ` +
+        `[telemetry] rss=${mb(mem.rss)}MB ` +
+        `heapUsed=${mb(mem.heapUsed)}MB ` +
+        `external=${mb(mem.external)}MB ` +
+        `cpu=${cpuPct.toFixed(1)}%`;
+
+      process.stdout.write(`${C.fg.yellow}${line}${C.reset}\n`);
+    } catch (e) {
+      const errLine =
+        `${C.dim}${hhmm()}${C.reset} ` +
+        `[telemetry] error: ${e.message || e}`;
+      process.stdout.write(`${C.fg.red}${errLine}${C.reset}\n`);
+    }
+  }, TELEMETRY_INTERVAL_SEC * 1000).unref();
 }
 
 // ---------- panel input handler ----------
@@ -741,7 +785,7 @@ process.stdin.on("data", (txt) => {
       try {
         game.stdin.write(payload + "\n");
         process.stdout.write(
-          `${C.dim}${hhmm()}${Creset} [stdin] ${payload}\n`,
+          `${C.dim}${hhmm()}${C.reset} [stdin] ${payload}\n`,
         );
       } catch {
         process.stdout.write(

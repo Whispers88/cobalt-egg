@@ -66,6 +66,10 @@ export RCON_MODE="${RCON_MODE:-legacy}"
 # auto = rcon if RCON_PASS set, else stdin
 export CONSOLE_MODE="${CONSOLE_MODE:-auto}"
 
+# ---------- telemetry for wrapper ----------
+# 0 = disabled; >0 = seconds between telemetry samples
+export TELEMETRY_INTERVAL_SEC="${TELEMETRY_INTERVAL_SEC:-0}"
+
 # Shutdown knobs
 SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-30}"
 
