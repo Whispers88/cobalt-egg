@@ -53,23 +53,20 @@ esac
 CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
-# RCON defaults (used by your wrapper & optional shutdown helpers)
+# RCON defaults (used by wrapper & optional shutdown helpers)
 export RCON_HOST="${RCON_HOST:-127.0.0.1}"
 export RCON_PORT="${RCON_PORT:-28016}"
 export RCON_PASS="${RCON_PASS:-}"
 
-# ---------- console routing ----------
+# RCON mode: legacy (Source RCON) or web (WebRCON / WebSocket)
+export RCON_MODE="${RCON_MODE:-legacy}"
+
+# ---------- console mode ----------
 # Options: stdin | rcon | auto
-#   stdin = panel input -> server STDIN
-#   rcon  = panel input -> RCON only
-#   auto  = RCON if RCON_PASS is set, else STDIN
-# Default to auto so panel uses RCON when configured.
+# auto = rcon if RCON_PASS set, else stdin
 export CONSOLE_MODE="${CONSOLE_MODE:-auto}"
 
-# ---------- (removed) heartbeat/watch ----------
-# No WATCH_ENABLED / HEARTBEAT_* / loops of any kind
-
-# Shutdown knobs (not used here directly; your wrapper may issue "quit")
+# Shutdown knobs
 SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-30}"
 
 # Disk & limits awareness
@@ -311,9 +308,8 @@ command -v "$NODE_BIN" >/dev/null 2>&1 || NODE_BIN="$(command -v node || true)"
 [[ -n "$NODE_BIN" ]] || { bad "node binary not found"; exit 15; }
 
 # ---------- Launch wrapper as PID 1 with line-buffered output ----------
-log "Launching via wrapper (argv mode; CONSOLE_MODE=${CONSOLE_MODE})"
+log "Launching via wrapper (argv mode; CONSOLE_MODE=${CONSOLE_MODE}, RCON_MODE=${RCON_MODE})"
 if command -v stdbuf >/dev/null 2>&1; then
-  # JS expects: node wrapper.js --argv <RustDedicated> <args...>
   exec stdbuf -oL -eL "$NODE_BIN" "$WRAPPER" --argv "${ARGV[@]}"
 else
   warn "stdbuf not found; logs may be buffered. Install coreutils for best console output."

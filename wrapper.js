@@ -10,8 +10,9 @@
 //     * "! <cmd>"      => run shell in container
 //     * "stdin: <x>"   => send to Rust STDIN (console)
 //     * "console: <x>" => alias of stdin
-//     * "rcon: <x>"    => send via RCON (legacy or Web, depending on RCON_MODE)
+//     * "rcon: <x>"    => send via RCON (legacy or Web, based on RCON_MODE)
 //     * default route  => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
+//     * ".stack"       => send SIGQUIT to RustDedicated for stack dump
 // - `.mode stdin|rcon|auto` switches default at runtime
 // - RCON_MODE=legacy|web selects legacy RCON or WebRCON
 // ============================================================================
@@ -25,7 +26,7 @@ let WebSocket = null;
 try {
   WebSocket = require("ws");
 } catch {
-  // it's fine; only needed for RCON_MODE=web
+  // ok; only needed if RCON_MODE=web
 }
 
 // ---------- config ----------
@@ -440,13 +441,13 @@ function ensureLegacyRconConnection() {
     });
 
     let tries = 0;
-    const waitReady = () => {
+    const waitReady2 = () => {
       if (rconReady && rconSocket) return resolve(rconSocket);
       if (!rconSocket) return reject(new Error("RCON connection failed"));
       if (tries++ > 40) return reject(new Error("RCON auth timeout"));
-      setTimeout(waitReady, 50);
+      setTimeout(waitReady2, 50);
     };
-    waitReady();
+    waitReady2();
   });
 }
 
@@ -527,15 +528,14 @@ function ensureWebRconConnection() {
       webRconSocket = null;
     });
 
-    // Fallback timeout in case 'open' never fires
     let tries = 0;
-    const waitReady = () => {
+    const waitReady2 = () => {
       if (webRconReady && webRconSocket) return resolve(webRconSocket);
       if (!webRconSocket) return reject(new Error("WebRCON connection failed"));
       if (tries++ > 80) return reject(new Error("WebRCON connect timeout"));
-      setTimeout(waitReady, 50);
+      setTimeout(waitReady2, 50);
     };
-    waitReady();
+    waitReady2();
   });
 }
 
@@ -622,6 +622,27 @@ process.stdin.on("data", (txt) => {
       } else {
         process.stdout.write(
           `${C.dim}${hhmm()}${C.reset} [mode] use: .mode stdin | rcon | auto\n`,
+        );
+      }
+      continue;
+    }
+
+    // 2b) Stack trace request
+    if (line.toLowerCase() === ".stack") {
+      if (game && !game.killed) {
+        process.stdout.write(
+          `${C.dim}${hhmm()}${C.reset} [stack] sending SIGQUIT to RustDedicated\n`,
+        );
+        try {
+          game.kill("SIGQUIT");
+        } catch (e) {
+          process.stdout.write(
+            `${C.fg.red}${hhmm()} [stack] failed to send SIGQUIT: ${e.message}${C.reset}\n`,
+          );
+        }
+      } else {
+        process.stdout.write(
+          `${C.fg.red}${hhmm()} [stack] game process not running${C.reset}\n`,
         );
       }
       continue;
