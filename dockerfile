@@ -1,83 +1,90 @@
-# --- Stage 1: fetch node + tini in an isolated builder ---
+# fetch node + tini
 FROM debian:bookworm-slim AS fetch
 ARG NODE_VERSION=20.17.0
+ARG TINI_VERSION=0.19.0
 
 RUN set -eux; \
   apt-get update; \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl xz-utils tar; \
+  apt-get install -y --no-install-recommends ca-certificates curl xz-utils tar gnupg; \
   rm -rf /var/lib/apt/lists/*
 
-# tini (init)
-RUN curl -fsSL -o /tini https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64 \
- && chmod +x /tini
+# tini 
+RUN set -eux; \
+  curl -fsSL -o /tini "https://github.com/krallin/tini/releases/download/v${TINI_VERSION}/tini-amd64"; \
+  curl -fsSL -o /tini.sha256 "https://github.com/krallin/tini/releases/download/v${TINI_VERSION}/tini-amd64.sha256sum"; \
+  sha256sum -c /tini.sha256; \
+  chmod +x /tini
 
-# official NodeJS binaries
-RUN arch="$(dpkg --print-architecture)"; \
-  case "$arch" in \
-    amd64) node_arch="x64" ;; \
-    arm64) node_arch="arm64" ;; \
-    *) echo "Unsupported arch: $arch" && exit 1 ;; \
-  esac; \
+# NodeJS (verify)
+RUN set -eux; \
+  arch="$(dpkg --print-architecture)"; \
+  case "$arch" in amd64) node_arch="x64" ;; arm64) node_arch="arm64" ;; *) echo "Unsupported arch: $arch" && exit 1 ;; esac; \
+  curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -o /tmp/SHASUMS256.txt; \
   curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" -o /tmp/node.tar.xz; \
+  (cd /tmp && grep " node-v${NODE_VERSION}-linux-${node_arch}.tar.xz\$" SHASUMS256.txt | sha256sum -c -); \
   mkdir -p /opt/node && tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1; \
-  rm -f /tmp/node.tar.xz
+  rm -f /tmp/node.tar.xz /tmp/SHASUMS256.txt
 
 
-# --- Stage 2: runtime using cm2network/steamcmd base ---
+# runtime using cm2network/steamcmd base
 FROM cm2network/steamcmd:latest
 
 USER root
 
-LABEL org.opencontainers.image.title="rust-universal-nosymlink"
-LABEL org.opencontainers.image.description="Rust Dedicated Server image for Pterodactyl using /mnt/server directly (no symlink)."
-LABEL maintainer="you@example.com"
+LABEL org.opencontainers.image.title="Cobalt-Rust-Pterodactly-Egg" \
+      org.opencontainers.image.description="Rust Dedicated Server image for Pterodactyl" \
+      org.opencontainers.image.source="cobaltstudios" \
+      maintainer="cobaltstudios"
 
-# copy tools
+# Copy tools
 COPY --from=fetch /tini /tini
 COPY --from=fetch /opt/node /opt/node
 
-# ensure Node is available
-ENV PATH="/opt/node/bin:${PATH}"
+# Node environment
+ENV PATH="/opt/node/bin:${PATH}" \
+    NODE_ENV=production \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
 
-# runtime deps needed by entrypoint (unzip important for uMod/Carbon)
+# Runtime deps (unzip for uMod/Carbon)
+ARG DEBIAN_FRONTEND=noninteractive
 RUN set -eux; \
   apt-get update; \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends unzip ca-certificates curl tzdata iproute2; \
+  apt-get install -y --no-install-recommends unzip ca-certificates curl tzdata iproute2 bash; \
   rm -rf /var/lib/apt/lists/*
 
-# create run user whose home is /mnt/server (matches Wings mount)
+# Ensure app dirs exist and are writable by steam
+ENV HOME=/mnt/server
 RUN set -eux; \
-  if command -v useradd >/dev/null 2>&1; then \
-    useradd -d /mnt/server -m -U -s /bin/bash container || true; \
-  else \
-    adduser -D -h /mnt/server -s /bin/sh container || true; \
-  fi
+  mkdir -p /opt/cobalt /mnt/server /mnt/server/steamcmd /mnt/server/logs; \
+  chown -R steam:steam /opt/cobalt /mnt/server
 
-# app bits live inside image (not in /mnt/server)
-# we keep wrapper + its node deps under /opt/cobalt so they exist even if /mnt/server is empty
-RUN mkdir -p /opt/cobalt
-COPY wrapper.js /opt/cobalt/wrapper.js
-COPY entrypoint.sh /entrypoint.sh
+# Keep wrapper deps inside image
+COPY --chown=steam:steam wrapper.js /opt/cobalt/wrapper.js
+COPY --chown=steam:steam entrypoint.sh /entrypoint.sh
 
-# install wrapper dependency
-RUN npm install --prefix /opt/cobalt --omit=dev ws@8
+# Install wrapper dependencys
+RUN set -eux; \
+  npm install --prefix /opt/cobalt --omit=dev ws@8; \
+  npm cache clean --force >/dev/null 2>&1 || true
 
-# perms
-RUN chmod +x /entrypoint.sh /opt/cobalt/wrapper.js
+# Permissions
+RUN set -eux; \
+  chmod +x /entrypoint.sh /tini; \
+  ln -sfn /mnt/server/steamcmd /home/steam/steamcmd || true; \
+  chown -h steam:steam /home/steam/steamcmd
 
-# Ptero-friendly defaults (match runtime use of /mnt/server)
-ENV HOME=/mnt/server \
-    FRAMEWORK=vanilla \
+# Ptero-friendly defaults
+ENV FRAMEWORK=vanilla \
     FRAMEWORK_UPDATE=1 \
     VALIDATE=1 \
-    TZ=UTC
+    TZ=UTC \
+    STEAMCMDDIR=/mnt/server/steamcmd
 
-# IMPORTANT: run in /mnt/server directly
 WORKDIR /mnt/server
 
-# drop privileges
-USER container
+# Drop privileges to 'steam' (matches base image expectations)
+USER steam
 
-# tini → bash entrypoint
+# tini - bash entrypoint
 ENTRYPOINT ["/tini","--","/entrypoint.sh"]
