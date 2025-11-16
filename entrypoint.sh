@@ -53,17 +53,17 @@ esac
 CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 export LATEST_LOG="${LATEST_LOG:-/home/container/latest.log}"
 
-# RCON defaults (used by wrapper & helpers)
+# RCON defaults (used by your wrapper & optional shutdown helpers)
 export RCON_HOST="${RCON_HOST:-127.0.0.1}"
 export RCON_PORT="${RCON_PORT:-28016}"
 export RCON_PASS="${RCON_PASS:-}"
 
 # ---------- console routing ----------
 # Options: stdin | rcon | auto
-#   stdin = panel input sent to server STDIN
-#   rcon  = panel input sent via RCON only
+#   stdin = panel input -> server STDIN
+#   rcon  = panel input -> RCON only
 #   auto  = RCON if RCON_PASS is set, else STDIN
-# Default to auto so that when RCON is configured, the panel uses RCON.
+# Default to auto so panel uses RCON when configured.
 export CONSOLE_MODE="${CONSOLE_MODE:-auto}"
 
 # ---------- (removed) heartbeat/watch ----------
@@ -234,7 +234,7 @@ install_carbon() {
     carbon* )         channel="production" ;;
   esac
   [[ "${FRAMEWORK}" == *"-minimal" ]] && minimal="1"
-  if [[ "$minimal" == "1" ]] then
+  if [[ "$minimal" == "1" ]]; then
     case "$channel" in
       production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release.Minimal.tar.gz" ;;
       edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge.Minimal.tar.gz" ;;

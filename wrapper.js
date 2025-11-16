@@ -9,7 +9,7 @@
 //     * "! <cmd>"      => run shell in container
 //     * "stdin: <x>"   => send to Rust STDIN (console)
 //     * "console: <x>" => alias of stdin
-//     * "rcon: <x>"    => send via RCON
+//     * "rcon: <x>"    => send via RCON (fire-and-forget)
 //     * default route  => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
 // - `.mode stdin|rcon|auto` switches default at runtime
 // ============================================================================
@@ -347,7 +347,7 @@ if (unityLogfile) {
   );
 }
 
-// ---------- RCON helpers ----------
+// ---------- RCON helpers (fire-and-forget) ----------
 const SERVERDATA_AUTH = 3;
 const SERVERDATA_EXECCOMMAND = 2;
 
@@ -365,42 +365,47 @@ function pkt(id, type, body) {
 }
 
 function sendRconOnce(cmdTxt) {
-  return new Promise((resolve, reject) => {
-    const s = net.createConnection(
+  return new Promise((resolve) => {
+    if (!RCON_PASS) return resolve();
+
+    const socket = net.createConnection(
       { host: RCON_HOST, port: RCON_PORT },
       () => {
-        s.write(pkt(1, SERVERDATA_AUTH, RCON_PASS));
-        setTimeout(
-          () => s.write(pkt(2, SERVERDATA_EXECCOMMAND, cmdTxt)),
-          150,
-        );
+        // auth first
+        socket.write(pkt(1, SERVERDATA_AUTH, RCON_PASS));
+
+        // then send the command shortly after
+        setTimeout(() => {
+          socket.write(pkt(2, SERVERDATA_EXECCOMMAND, cmdTxt));
+
+          // give it a moment to flush, then close
+          setTimeout(() => {
+            try {
+              socket.end();
+            } catch {}
+            resolve();
+          }, 200);
+        }, 150);
       },
     );
 
-    const chunks = [];
-    s.on("data", (d) => chunks.push(d));
-    s.on("error", (e) => reject(e));
-    s.setTimeout(4000, () => {
-      try {
-        s.destroy();
-      } catch {}
-      reject(new Error("rcon timeout"));
+    // fire-and-forget: we don't care about data
+    socket.on("data", () => {});
+
+    socket.on("error", (e) => {
+      process.stdout.write(
+        `${C.fg.red}${hhmm()} [rcon] ${cmdTxt} -> ${e.message}${C.reset}\n`,
+      );
+      resolve();
     });
 
-    setTimeout(() => {
+    socket.setTimeout(2000, () => {
       try {
-        s.end();
+        socket.destroy();
       } catch {}
-      resolve(Buffer.concat(chunks));
-    }, 650);
+      resolve();
+    });
   });
-}
-
-function decodeRconBuffer(buf) {
-  const txt = buf
-    .toString("utf8")
-    .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
-  return txt.trim();
 }
 
 // ---------- panel input handler ----------
@@ -481,7 +486,7 @@ process.stdin.on("data", (txt) => {
       route = "stdin";
     }
 
-    // 5) Dispatch (with STDIN ack)
+    // 5) Dispatch (with simple acks)
     if (route === "stdin") {
       try {
         game.stdin.write(payload + "\n");
@@ -494,27 +499,18 @@ process.stdin.on("data", (txt) => {
         );
       }
     } else {
+      // route === "rcon"
       sendRconOnce(payload)
-        .then((buf) => {
-          const body = decodeRconBuffer(buf);
-          if (body) {
-            for (const l of body.split(/\r?\n/)) {
-              if (!l.trim()) continue;
-              process.stdout.write(
-                `${C.dim}${hhmm()}${C.reset} [rcon] ${l}\n`,
-              );
-            }
-          } else {
-            process.stdout.write(
-              `${C.dim}${hhmm()}${C.reset} [rcon] (no response)\n`,
-            );
-          }
+        .then(() => {
+          process.stdout.write(
+            `${C.dim}${hhmm()}${C.reset} [rcon] sent: ${payload}\n`,
+          );
         })
-        .catch((e) =>
+        .catch((e) => {
           process.stdout.write(
             `${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${C.reset}\n`,
-          ),
-        );
+          );
+        });
     }
   }
 });
