@@ -508,9 +508,44 @@ function ensureWebRconConnection() {
       resolve(ws);
     });
 
-    ws.on("message", () => {
-      // Server responses; we ignore and rely on normal log output.
+    ws.on("message", (data) => {
+      try {
+        const txt = data.toString("utf8");
+
+        // Rust WebRCON sends JSON: { Identifier, Message, Type, ... }
+        let obj = null;
+        try {
+          obj = JSON.parse(txt);
+        } catch {
+          obj = null;
+        }
+
+        let payload = "";
+
+        if (obj && typeof obj.Message === "string") {
+          payload = obj.Message;
+        } else {
+          // fallback: treat raw text as the body
+          payload = txt;
+        }
+
+        // Clean & split into lines
+        payload = payload.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
+        const lines = payload.split(/\r?\n/);
+
+        for (const ln of lines) {
+          if (!ln.trim()) continue;
+          const out = `${C.dim}${hhmm()}${C.reset} [rcon] ${ln}`;
+          // Pick a color you like; cyan is a nice "remote" hint
+          process.stdout.write(`${C.fg.cyan}${out}${C.reset}\n`);
+        }
+      } catch (e) {
+        process.stdout.write(
+          `${C.fg.red}${hhmm()} [rcon] WebRCON message decode error: ${e.message}${C.reset}\n`,
+        );
+      }
     });
+
 
     ws.on("error", (e) => {
       process.stdout.write(
