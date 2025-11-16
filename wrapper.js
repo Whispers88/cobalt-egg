@@ -11,8 +11,9 @@
 //     * "stdin: <x>"   => send to Rust STDIN (console)
 //     * "console: <x>" => alias of stdin
 //     * "rcon: <x>"    => send via RCON (legacy or Web, based on RCON_MODE)
-//     * default route  => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
-//     * ".stack"       => use gdb to pause RustDedicated, dump backtraces, resume
+//     * ".stack"       => gdb backtrace of RustDedicated
+//     * ".heap"        => Node wrapper heap/memory stats
+//     * ".telemetry"   => quick CPU/memory snapshot (wrapper + Rust + system)
 // - `.mode stdin|rcon|auto` switches default at runtime
 // - RCON_MODE=legacy|web selects legacy RCON or WebRCON
 // ============================================================================
@@ -20,6 +21,7 @@
 const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
+const os = require("os");
 
 // Optional WebSocket client for WebRCON mode
 let WebSocket = null;
@@ -362,46 +364,7 @@ if (unityLogfile) {
   );
 }
 
-// ---------- helper to resolve actual RustDedicated PID ----------
-function resolveRustPid(callback) {
-  if (!game || game.killed) {
-    callback(null);
-    return;
-  }
-
-  // If we're *not* going through `script`, game.pid is RustDedicated.
-  if (!scriptBin || forcePlainStdin) {
-    callback(game.pid);
-    return;
-  }
-
-  // Otherwise, find RustDedicated via pgrep.
-  const ps = spawn("pgrep", ["-f", "RustDedicated"], {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  let out = "";
-  ps.stdout.on("data", (d) => (out += d.toString()));
-
-  ps.on("exit", (code) => {
-    if (code !== 0) {
-      callback(null);
-      return;
-    }
-    const tokens = out.trim().split(/\s+/);
-    const pidStr = tokens[tokens.length - 1];
-    const pid = parseInt(pidStr, 10);
-    if (!pid || Number.isNaN(pid)) {
-      callback(null);
-    } else {
-      callback(pid);
-    }
-  });
-
-  ps.on("error", () => callback(null));
-}
-
-// ---------- RCON helpers (persistent; legacy + optional WebRCON) ----------
+// ---------- RCON helpers (persistent; legacy + WebRCON) ----------
 const SERVERDATA_AUTH = 3;
 const SERVERDATA_EXECCOMMAND = 2;
 
@@ -576,10 +539,8 @@ function ensureWebRconConnection() {
           const trimmed = ln.trim();
           if (!trimmed) continue;
 
-          // Ignore only lines that start with "[oxide]" (oxide already logs to console)
-          if (trimmed.startsWith("[oxide]")) {
-            continue;
-          }
+          // Ignore only lines that *start* with "[oxide]" (oxide already logs to game console)
+          if (trimmed.startsWith("[oxide]")) continue;
 
           const out = `${C.dim}${hhmm()}${C.reset} [rcon] ${ln}`;
           process.stdout.write(`${C.fg.cyan}${out}${C.reset}\n`);
@@ -652,6 +613,87 @@ function sendRconOnce(cmdTxt) {
   return sendLegacyRconOnce(cmdTxt);
 }
 
+// ---------- resolve RustDedicated PID (for .stack / .telemetry) ----------
+function resolveRustPid(callback) {
+  if (!game || game.killed) {
+    callback(null);
+    return;
+  }
+
+  // If we're *not* going through `script`, game.pid is RustDedicated.
+  if (!scriptBin || forcePlainStdin) {
+    callback(game.pid);
+    return;
+  }
+
+  // Try pgrep first
+  const tryPgrep = () => {
+    const ps = spawn("pgrep", ["-f", "RustDedicated"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let out = "";
+    ps.stdout.on("data", (d) => (out += d.toString()));
+
+    ps.on("exit", (code) => {
+      if (code !== 0 || !out.trim()) {
+        // fallback to ps/grep
+        tryPsGrep();
+        return;
+      }
+      const tokens = out.trim().split(/\s+/);
+      const pidStr = tokens[tokens.length - 1];
+      const pid = parseInt(pidStr, 10);
+      if (!pid || Number.isNaN(pid)) {
+        tryPsGrep();
+      } else {
+        callback(pid);
+      }
+    });
+
+    ps.on("error", () => {
+      // pgrep not available → fallback
+      tryPsGrep();
+    });
+  };
+
+  const tryPsGrep = () => {
+    const finder = spawn(
+      "sh",
+      [
+        "-lc",
+        "ps -eo pid,args | grep -i 'RustDedicated' | grep -v grep | awk '{print $1}'",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    let out = "";
+    finder.stdout.on("data", (d) => (out += d.toString()));
+
+    finder.on("exit", () => {
+      const pidStr = out.trim().split(/\s+/)[0] || "";
+      const pid = parseInt(pidStr, 10);
+      if (!pid || Number.isNaN(pid)) {
+        process.stdout.write(
+          `${C.fg.red}${hhmm()} [stack] could not find RustDedicated via ps/pgrep${C.reset}\n`,
+        );
+        callback(null);
+      } else {
+        callback(pid);
+      }
+    });
+
+    finder.on("error", () => {
+      process.stdout.write(
+        `${C.fg.red}${hhmm()} [stack] ps/grep lookup failed${C.reset}\n`,
+      );
+      callback(null);
+    });
+  };
+
+  tryPgrep();
+}
+
 // ---------- panel input handler ----------
 process.stdin.setEncoding("utf8");
 let stdinBuf = "";
@@ -706,7 +748,7 @@ process.stdin.on("data", (txt) => {
       continue;
     }
 
-    // 2b) Stack trace request via gdb (pause, dump, resume) on real RustDedicated PID
+    // 2b) .stack → gdb backtrace
     if (line.toLowerCase() === ".stack") {
       resolveRustPid((pid) => {
         if (!pid) {
@@ -728,32 +770,100 @@ process.stdin.on("data", (txt) => {
           },
         );
 
-        let stderrBuf = "";
-
         bt.stdout.on("data", (d) => {
+          const text = d.toString();
           process.stdout.write(
-            `${C.dim}${hhmm()}${C.reset} [gdb] ${d.toString()}`,
+            `${C.dim}${hhmm()}${C.reset} [gdb] ${text}`,
           );
         });
 
         bt.stderr.on("data", (d) => {
-          const s = d.toString();
-          stderrBuf += s;
+          const text = d.toString();
           process.stdout.write(
-            `${C.fg.red}${hhmm()} [gdb] ${s}${C.reset}`,
+            `${C.fg.red}${hhmm()} [gdb] ${text}${C.reset}`,
           );
         });
 
         bt.on("exit", (code) => {
-          if (/Operation not permitted/.test(stderrBuf)) {
+          process.stdout.write(
+            `${C.dim}${hhmm()}${C.reset} [stack] gdb exited with code ${code}\n`,
+          );
+        });
+      });
+      continue;
+    }
+
+    // 2c) .heap → Node wrapper heap info
+    if (line.toLowerCase() === ".heap") {
+      const m = process.memoryUsage();
+      const toMB = (v) => (v / 1024 / 1024).toFixed(1);
+
+      process.stdout.write(
+        `${C.dim}${hhmm()}${C.reset} [heap] rss=${toMB(
+          m.rss,
+        )}MB heapUsed=${toMB(m.heapUsed)}MB heapTotal=${toMB(
+          m.heapTotal,
+        )}MB external=${toMB(m.external)}MB arrayBuffers=${toMB(
+          m.arrayBuffers || 0,
+        )}MB\n`,
+      );
+      continue;
+    }
+
+    // 2d) .telemetry → quick snapshot
+    if (line.toLowerCase() === ".telemetry") {
+      const m = process.memoryUsage();
+      const toMB = (v) => (v / 1024 / 1024).toFixed(1);
+      const uptime = process.uptime().toFixed(0);
+      const load = os.loadavg ? os.loadavg() : [0, 0, 0];
+
+      process.stdout.write(
+        `${C.dim}${hhmm()}${C.reset} [telemetry] wrapper: rss=${toMB(
+          m.rss,
+        )}MB heapUsed=${toMB(m.heapUsed)}MB uptime=${uptime}s loadavg=${load
+          .map((v) => v.toFixed(2))
+          .join(",")}\n`,
+      );
+
+      resolveRustPid((pid) => {
+        if (!pid) {
+          process.stdout.write(
+            `${C.dim}${hhmm()}${C.reset} [telemetry] rust: pid=unknown (could not resolve)\n`,
+          );
+          return;
+        }
+
+        const ps = spawn(
+          "sh",
+          [
+            "-lc",
+            `ps -p ${pid} -o pid,pcpu,pmem,rss,etime,args | sed -n '2p'`,
+          ],
+          {
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+
+        let out = "";
+        ps.stdout.on("data", (d) => (out += d.toString()));
+
+        ps.on("exit", () => {
+          const line = out.trim();
+          if (!line) {
             process.stdout.write(
-              `${C.fg.red}${hhmm()} [stack] gdb could not attach (ptrace blocked by host/container security).${C.reset}\n`,
+              `${C.dim}${hhmm()}${C.reset} [telemetry] rust: no ps output (pid ${pid})\n`,
             );
           } else {
             process.stdout.write(
-              `${C.dim}${hhmm()}${C.reset} [stack] gdb exited with code ${code}\n`,
+              `${C.dim}${hhmm()}${C.reset} [telemetry] rust: ${line}\n`,
             );
           }
+        });
+
+        ps.on("error", (e) => {
+          process.stdout.write(
+            `${C.fg.red}${hhmm()} [telemetry] ps error: ${e.message}${C.reset}\n`,
+          );
         });
       });
 
