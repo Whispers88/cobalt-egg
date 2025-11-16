@@ -42,10 +42,11 @@ ENV PATH="/opt/node/bin:${PATH}"
 ENV NODE_ENV=production
 
 # runtime deps needed by entrypoint (unzip important for uMod/Carbon)
+# NOTE: gdb added so .stack (gdb backtrace) works
 RUN set -eux; \
   apt-get update; \
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    unzip ca-certificates curl tzdata iproute2; \
+    unzip ca-certificates curl tzdata iproute2 gdb; \
   rm -rf /var/lib/apt/lists/*
 
 # app bits live inside image (not in /mnt/server)
