@@ -2,7 +2,8 @@
 
 // ============================================================================
 // Rust wrapper — PTY-aware, argv-safe, logfile mirroring, panel->RCON/STDIN shim
-// - Prefers launching via `script -qefc` to give the game a PTY (so STDIN works)
+// - If starting in CONSOLE_MODE=stdin: run Rust directly so STDIN works
+// - If starting in rcon/auto: prefers launching via `script -qefc` for PTY
 // - Uses `stdbuf -oL -eL` (if present) for line-buffered output
 // - Pretty console formatting; mirrors raw to latest.log; tails -logfile if present
 // - Panel input:
@@ -277,9 +278,12 @@ function emitPretty(sourceKey, chunk, isErr = false) {
   }
 }
 
-// ---------- spawn Rust with PTY (script) + line buffer (stdbuf) ----------
+// ---------- spawn Rust with or without PTY ----------
 const scriptBin = which("script"); // util-linux
 const stdbufBin = which("stdbuf"); // coreutils
+
+// If we *start* in stdin mode, prefer a direct pipe so game.stdin is really Rust's stdin.
+const forcePlainStdin = initialMode === "stdin";
 
 let cmd;
 let args;
@@ -292,8 +296,8 @@ const realCmd = (() => {
   return seq.map(shQuote).join(" ");
 })();
 
-if (scriptBin) {
-  // Run under a PTY: script -qefc "<realCmd>" /dev/null
+if (scriptBin && !forcePlainStdin) {
+  // RCON / auto modes: run under a PTY: script -qefc "<realCmd>" /dev/null
   cmd = scriptBin;
   args = ["-qefc", realCmd, "/dev/null"];
   process.stdout.write(
@@ -302,17 +306,17 @@ if (scriptBin) {
     }\n`,
   );
 } else if (stdbufBin) {
-  // Fallback: no PTY but still line-buffer
+  // stdin mode (or no script): run RustDedicated directly, with stdbuf if available
   cmd = stdbufBin;
   args = ["-oL", "-eL", executable, ...params];
   process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} 'script' not found; running without PTY (using stdbuf)\n`,
+    `${C.dim}${hhmm()}${C.reset} running without PTY (using stdbuf)\n`,
   );
 } else {
   cmd = executable;
   args = params;
   process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} 'script' & 'stdbuf' not found; running plain (STDIN may be ignored)\n`,
+    `${C.dim}${hhmm()}${C.reset} running plain (no script, no stdbuf)\n`,
   );
 }
 
