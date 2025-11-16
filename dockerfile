@@ -5,7 +5,7 @@ ARG NODE_VERSION=20.17.0
 RUN set -eux; \
   apt-get update; \
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl xz-utils tar; \
+    unzip ca-certificates curl tzdata iproute2 gdb procps; \
   rm -rf /var/lib/apt/lists/*
 
 # tini (init)
