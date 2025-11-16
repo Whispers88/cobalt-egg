@@ -12,7 +12,7 @@ RUN set -eux; \
 RUN curl -fsSL -o /tini https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64 \
  && chmod +x /tini
 
-# official NodeJS binaries
+# official NodeJS binaries (includes node, npm, npx)
 RUN arch="$(dpkg --print-architecture)"; \
   case "$arch" in \
     amd64) node_arch="x64" ;; \
@@ -33,26 +33,20 @@ LABEL org.opencontainers.image.title="rust-universal-nosymlink"
 LABEL org.opencontainers.image.description="Rust Dedicated Server image for Pterodactyl using /mnt/server directly (no symlink)."
 LABEL maintainer="you@example.com"
 
-# copy tools
+# copy tools from builder
 COPY --from=fetch /tini /tini
 COPY --from=fetch /opt/node /opt/node
 
-# ensure Node is available
+# ensure Node + npm are available
 ENV PATH="/opt/node/bin:${PATH}"
+ENV NODE_ENV=production
 
 # runtime deps needed by entrypoint (unzip important for uMod/Carbon)
 RUN set -eux; \
   apt-get update; \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends unzip ca-certificates curl tzdata iproute2; \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    unzip ca-certificates curl tzdata iproute2; \
   rm -rf /var/lib/apt/lists/*
-
-# create run user whose home is /mnt/server (matches Wings mount)
-RUN set -eux; \
-  if command -v useradd >/dev/null 2>&1; then \
-    useradd -d /mnt/server -m -U -s /bin/bash container || true; \
-  else \
-    adduser -D -h /mnt/server -s /bin/sh container || true; \
-  fi
 
 # app bits live inside image (not in /mnt/server)
 # we keep wrapper + its node deps under /opt/cobalt so they exist even if /mnt/server is empty
@@ -60,8 +54,10 @@ RUN mkdir -p /opt/cobalt
 COPY wrapper.js /opt/cobalt/wrapper.js
 COPY entrypoint.sh /entrypoint.sh
 
-# install wrapper dependency
-RUN npm install --prefix /opt/cobalt --omit=dev ws@8
+# install wrapper dependency (ws for WebRCON support)
+RUN set -eux; \
+  npm install --prefix /opt/cobalt --omit=dev ws@8; \
+  npm cache clean --force
 
 # perms
 RUN chmod +x /entrypoint.sh /opt/cobalt/wrapper.js

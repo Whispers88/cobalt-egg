@@ -10,20 +10,30 @@
 //     * "! <cmd>"      => run shell in container
 //     * "stdin: <x>"   => send to Rust STDIN (console)
 //     * "console: <x>" => alias of stdin
-//     * "rcon: <x>"    => send via RCON (fire-and-forget)
+//     * "rcon: <x>"    => send via RCON (legacy or Web, depending on RCON_MODE)
 //     * default route  => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
 // - `.mode stdin|rcon|auto` switches default at runtime
+// - RCON_MODE=legacy|web selects legacy RCON or WebRCON
 // ============================================================================
 
 const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
 
+// Optional WebSocket client for WebRCON mode
+let WebSocket = null;
+try {
+  WebSocket = require("ws");
+} catch {
+  // it's fine; only needed for RCON_MODE=web
+}
+
 // ---------- config ----------
 const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
 const RCON_HOST = process.env.RCON_HOST || "127.0.0.1";
 const RCON_PORT = parseInt(process.env.RCON_PORT || "28016", 10);
 const RCON_PASS = process.env.RCON_PASS || "";
+const RCON_MODE = (process.env.RCON_MODE || "legacy").toLowerCase(); // legacy | web
 
 const initialMode = (process.env.CONSOLE_MODE || "auto").toLowerCase();
 const COLOR_OK = process.stdout.isTTY && !("NO_COLOR" in process.env);
@@ -351,7 +361,7 @@ if (unityLogfile) {
   );
 }
 
-// ---------- RCON helpers (fire-and-forget) ----------
+// ---------- RCON helpers (persistent; legacy + optional WebRCON) ----------
 const SERVERDATA_AUTH = 3;
 const SERVERDATA_EXECCOMMAND = 2;
 
@@ -368,48 +378,199 @@ function pkt(id, type, body) {
   return buf;
 }
 
-function sendRconOnce(cmdTxt) {
-  return new Promise((resolve) => {
-    if (!RCON_PASS) return resolve();
+// --- legacy RCON (Source-style TCP) ---
+let rconSocket = null;
+let rconReady = false;
+
+function ensureLegacyRconConnection() {
+  return new Promise((resolve, reject) => {
+    if (!RCON_PASS) return reject(new Error("RCON_PASS not set"));
+
+    if (rconSocket && rconReady) return resolve(rconSocket);
+
+    if (rconSocket && !rconReady) {
+      let tries = 0;
+      const waitReady = () => {
+        if (rconReady && rconSocket) return resolve(rconSocket);
+        if (!rconSocket) return reject(new Error("RCON socket lost"));
+        if (tries++ > 40) return reject(new Error("RCON auth timeout"));
+        setTimeout(waitReady, 50);
+      };
+      return waitReady();
+    }
 
     const socket = net.createConnection(
       { host: RCON_HOST, port: RCON_PORT },
       () => {
-        // auth first
-        socket.write(pkt(1, SERVERDATA_AUTH, RCON_PASS));
-
-        // then send the command shortly after
-        setTimeout(() => {
-          socket.write(pkt(2, SERVERDATA_EXECCOMMAND, cmdTxt));
-
-          // give it a moment to flush, then close
-          setTimeout(() => {
-            try {
-              socket.end();
-            } catch {}
-            resolve();
-          }, 200);
-        }, 150);
+        try {
+          socket.write(pkt(1, SERVERDATA_AUTH, RCON_PASS));
+        } catch (e) {
+          return reject(e);
+        }
       },
     );
 
-    // fire-and-forget: we don't care about data
-    socket.on("data", () => {});
+    rconSocket = socket;
+    rconReady = false;
+
+    socket.on("data", (d) => {
+      if (!rconReady) {
+        rconReady = true;
+        process.stdout.write(
+          `${C.dim}${hhmm()}${C.reset} [rcon] legacy connection authed\n`,
+        );
+      }
+      // Ignore body; server logs output anyway.
+    });
 
     socket.on("error", (e) => {
       process.stdout.write(
-        `${C.fg.red}${hhmm()} [rcon] ${cmdTxt} -> ${e.message}${C.reset}\n`,
+        `${C.fg.red}${hhmm()} [rcon] legacy socket error: ${e.message}${C.reset}\n`,
       );
-      resolve();
+      rconReady = false;
+      rconSocket = null;
     });
 
-    socket.setTimeout(2000, () => {
+    socket.on("close", () => {
+      process.stdout.write(
+        `${C.dim}${hhmm()}${C.reset} [rcon] legacy connection closed\n`,
+      );
+      rconReady = false;
+      rconSocket = null;
+    });
+
+    let tries = 0;
+    const waitReady = () => {
+      if (rconReady && rconSocket) return resolve(rconSocket);
+      if (!rconSocket) return reject(new Error("RCON connection failed"));
+      if (tries++ > 40) return reject(new Error("RCON auth timeout"));
+      setTimeout(waitReady, 50);
+    };
+    waitReady();
+  });
+}
+
+function sendLegacyRconOnce(cmdTxt) {
+  if (!RCON_PASS || !cmdTxt.trim()) return Promise.resolve();
+  return ensureLegacyRconConnection().then((socket) => {
+    return new Promise((resolve, reject) => {
       try {
-        socket.destroy();
-      } catch {}
-      resolve();
+        const id = Date.now() & 0x7fffffff;
+        socket.write(pkt(id, SERVERDATA_EXECCOMMAND, cmdTxt));
+        resolve();
+      } catch (e) {
+        reject(e);
+      }
     });
   });
+}
+
+// --- WebRCON (WebSocket JSON) ---
+let webRconSocket = null;
+let webRconReady = false;
+
+function ensureWebRconConnection() {
+  return new Promise((resolve, reject) => {
+    if (!RCON_PASS) return reject(new Error("RCON_PASS not set"));
+    if (!WebSocket) {
+      return reject(
+        new Error("WebRCON mode requires 'ws' package (npm install ws)"),
+      );
+    }
+
+    if (webRconSocket && webRconReady) return resolve(webRconSocket);
+
+    if (webRconSocket && !webRconReady) {
+      let tries = 0;
+      const waitReady = () => {
+        if (webRconReady && webRconSocket) return resolve(webRconSocket);
+        if (!webRconSocket) return reject(new Error("WebRCON socket lost"));
+        if (tries++ > 40) return reject(new Error("WebRCON connect timeout"));
+        setTimeout(waitReady, 50);
+      };
+      return waitReady();
+    }
+
+    const url = `ws://${RCON_HOST}:${RCON_PORT}/${encodeURIComponent(
+      RCON_PASS,
+    )}`;
+    const ws = new WebSocket(url);
+
+    webRconSocket = ws;
+    webRconReady = false;
+
+    ws.on("open", () => {
+      webRconReady = true;
+      process.stdout.write(
+        `${C.dim}${hhmm()}${C.reset} [rcon] WebRCON connected\n`,
+      );
+      resolve(ws);
+    });
+
+    ws.on("message", () => {
+      // Server responses; we ignore and rely on normal log output.
+    });
+
+    ws.on("error", (e) => {
+      process.stdout.write(
+        `${C.fg.red}${hhmm()} [rcon] WebRCON error: ${e.message}${C.reset}\n`,
+      );
+      webRconReady = false;
+      webRconSocket = null;
+    });
+
+    ws.on("close", () => {
+      process.stdout.write(
+        `${C.dim}${hhmm()}${C.reset} [rcon] WebRCON closed\n`,
+      );
+      webRconReady = false;
+      webRconSocket = null;
+    });
+
+    // Fallback timeout in case 'open' never fires
+    let tries = 0;
+    const waitReady = () => {
+      if (webRconReady && webRconSocket) return resolve(webRconSocket);
+      if (!webRconSocket) return reject(new Error("WebRCON connection failed"));
+      if (tries++ > 80) return reject(new Error("WebRCON connect timeout"));
+      setTimeout(waitReady, 50);
+    };
+    waitReady();
+  });
+}
+
+function sendWebRconOnce(cmdTxt) {
+  if (!RCON_PASS || !cmdTxt.trim()) return Promise.resolve();
+  return ensureWebRconConnection().then((ws) => {
+    return new Promise((resolve, reject) => {
+      try {
+        const id = Date.now() & 0x7fffffff;
+        const payload = {
+          Identifier: id,
+          Message: cmdTxt,
+          Name: "WebRcon",
+        };
+        ws.send(JSON.stringify(payload), (err) => {
+          if (err) return reject(err);
+          resolve();
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+// --- unified sendRconOnce (picks legacy vs WebRCON) ---
+function sendRconOnce(cmdTxt) {
+  if (!RCON_PASS || !cmdTxt.trim()) return Promise.resolve();
+
+  if (RCON_MODE === "web") {
+    return sendWebRconOnce(cmdTxt);
+  }
+
+  // default: legacy
+  return sendLegacyRconOnce(cmdTxt);
 }
 
 // ---------- panel input handler ----------
@@ -490,7 +651,7 @@ process.stdin.on("data", (txt) => {
       route = "stdin";
     }
 
-    // 5) Dispatch (with simple acks)
+    // 5) Dispatch
     if (route === "stdin") {
       try {
         game.stdin.write(payload + "\n");
@@ -504,17 +665,11 @@ process.stdin.on("data", (txt) => {
       }
     } else {
       // route === "rcon"
-      sendRconOnce(payload)
-        .then(() => {
-          process.stdout.write(
-            `${C.dim}${hhmm()}${C.reset} [rcon] sent: ${payload}\n`,
-          );
-        })
-        .catch((e) => {
-          process.stdout.write(
-            `${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${C.reset}\n`,
-          );
-        });
+      sendRconOnce(payload).catch((e) => {
+        process.stdout.write(
+          `${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${C.reset}\n`,
+        );
+      });
     }
   }
 });
