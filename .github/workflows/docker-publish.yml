@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - v2
     tags:
       - 'v*'
 
@@ -35,7 +36,13 @@ jobs:
           OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           REPO=$(basename "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           IMAGE_NAME="ghcr.io/${OWNER}/${REPO}"
-          DEFAULT_TAG="${IMAGE_NAME}:latest"
+          # main + release tags publish :latest; other branches publish :<branch>
+          # so v2 can be tested without touching servers that pull :latest
+          if [[ "$GITHUB_REF_TYPE" == "tag" || "$GITHUB_REF_NAME" == "main" ]]; then
+            DEFAULT_TAG="${IMAGE_NAME}:latest"
+          else
+            DEFAULT_TAG="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          fi
 
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             VERSION_TAG="${IMAGE_NAME}:${GITHUB_REF_NAME/v/}"
