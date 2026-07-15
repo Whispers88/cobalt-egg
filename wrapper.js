@@ -247,21 +247,36 @@ tailProc.stdout.on("data", (d) => {
 tailProc.stderr.on("data", () => {}); // "file truncated" notices etc.
 tailProc.on("error", (e) => werr(`[cobalt] tail failed: ${e.message} — console read channel dead`));
 
-// ---------- WebRCON (persistent, matched-response-only) ----------
-let ws = null, wsReady = false, backoff = 1000, nextId = 1;
+// ---------- WebRCON (persistent, matched-response-only, auto-reconnecting) ----------
+let ws = null, wsReady = false, connecting = false, nextId = 1;
 let announcedWaiting = false, exiting = false;
 const pendingResp = new Map(); // id -> { cmd, ts }
 const sendQueue = [];          // commands queued before rcon is up
 const QUEUE_MAX = 20;
 
+// Rust boots with RCON DOWN, so the first attempts always fail. A steady 3s
+// retry + these guards drive reconnection — we must NOT depend on which of
+// error/close undici fires (on Linux a refused connect fires error WITHOUT
+// close), or the loop dies after one failed attempt and never reconnects.
 function rconConnect() {
-  if (!RCON_PASS || exiting) return;
+  if (!RCON_PASS || exiting || connecting || wsReady) return;
+  connecting = true;
   let sock;
   try { sock = new WebSocket(`ws://${RCON_HOST}:${RCON_PORT}/${encodeURIComponent(RCON_PASS)}`); }
-  catch { return scheduleReconnect(); }
+  catch (e) { connecting = false; werr(`[rcon] connect error: ${e.message}`); return; }
   ws = sock;
+  let settled = false;
+  const timer = setTimeout(() => done("connect timeout"), 10000);
+  function done(why) {                 // fires on error OR close OR timeout, once
+    if (settled) return; settled = true;
+    clearTimeout(timer); connecting = false;
+    const wasReady = wsReady; wsReady = false;
+    if (ws === sock) ws = null;
+    try { sock.close(); } catch {}
+    if (wasReady) wline(`[rcon] disconnected (${why}) — retrying`);
+  }
   sock.addEventListener("open", () => {
-    wsReady = true; backoff = 1000; announcedWaiting = false;
+    settled = true; clearTimeout(timer); connecting = false; wsReady = true; announcedWaiting = false;
     wline(`[rcon] connected (${RCON_HOST}:${RCON_PORT})`);
     while (sendQueue.length && wsReady) rconSend(sendQueue.shift());
   });
@@ -277,18 +292,10 @@ function rconConnect() {
       process.stdout.write(`${C.dim}${hhmm()}${C.reset} ${C.cyan}[rcon] ${ln}${C.reset}\n`);
     }
   });
-  sock.addEventListener("error", () => {});
-  sock.addEventListener("close", () => {
-    if (wsReady) wline("[rcon] disconnected");
-    wsReady = false; ws = null;
-    if (!exiting) scheduleReconnect();
-  });
+  sock.addEventListener("error", () => done("error"));
+  sock.addEventListener("close", (e) => done("close " + ((e && e.code) || "")));
 }
-function scheduleReconnect() {
-  if (exiting) return;
-  setTimeout(rconConnect, backoff).unref();
-  backoff = Math.min(backoff * 2, 30000);
-}
+
 function rconSend(cmd) {
   if (!RCON_PASS) { werr("[rcon] disabled — RCON_PASS not set"); return false; }
   if (!wsReady || !ws) {
@@ -305,7 +312,10 @@ function rconSend(cmd) {
   try { ws.send(JSON.stringify({ Identifier: id, Message: cmd, Name: "Cobalt" })); return true; }
   catch (e) { pendingResp.delete(id); werr(`[rcon] send failed: ${e.message}`); return false; }
 }
+
+wline(`[rcon] connecting to ${RCON_HOST}:${RCON_PORT}…`);
 rconConnect();
+setInterval(rconConnect, 3000).unref(); // retry until connected; reconnect after any drop
 
 // ---------- telemetry (the GAME's cpu/rss via /proc, not the wrapper's) ----------
 let lastStat = null; // { pid, total, at }

@@ -228,11 +228,30 @@ async function test5_colours() {
   await r.waitExit();
 }
 
+async function test6_reconnectAfterDelay() {
+  console.log("test 6: connects after RCON is initially down (the Linux undici bug)");
+  const home = mkHome();
+  writeAcf(home, 11111);
+  const r = new Run(home, { mockArgs: ["--rcon-delay", "2500"] }); // RCON binds 2.5s late
+  await r.waitFor(/\[rcon\] connecting to/);
+  await r.waitFor(/Server startup complete/);
+  r.send("status"); // sent while RCON is still down
+  await r.waitFor(/not connected yet — command queued/);
+  ok("command queued while RCON down");
+  await r.waitFor(/\[rcon\] connected/, 12000); // must reconnect after the delay
+  ok("wrapper reconnects once RCON comes up (retry loop is event-quirk-proof)");
+  await r.waitFor(/\[rcon\] hostname: mock-rust/, 8000); // queued status flushes
+  ok("queued command flushed on connect");
+  r.send("quit");
+  await r.waitExit();
+}
+
 (async () => {
   await test1_happyPath();
   await test2_stdinFallback();
   await test3_escalation();
   await test4_rollbackStaging();
   await test5_colours();
+  await test6_reconnectAfterDelay();
   console.log(`\nE2E: all ${passed} checks passed`);
 })().catch((e) => { console.error("\nE2E FAILED:", e.message); process.exit(1); });

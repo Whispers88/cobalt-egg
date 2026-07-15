@@ -92,15 +92,19 @@ const server = net.createServer((sock) => {
   sock.on("close", () => clients.delete(sock));
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  wl("Bootstrapping ...");
-  setTimeout(() => wl("[Oxide] Loading extension Oxide.Rust"), 100);
-  setTimeout(() => wl("Server startup complete"), 300);
-  let n = 0;
-  setInterval(() => wl("tick " + ++n), 400).unref();
-  // unsolicited broadcast spam — the wrapper must NOT print these
-  setInterval(() => { for (const c of clients) wsSend(c, { Identifier: 0, Message: "SPAMLINE console noise", Type: "Generic" }); }, 250).unref();
-});
+// boot logs fire immediately (game process is "up"); RCON binds after an optional
+// delay so tests can exercise "wrapper starts before RCON is listening"
+const RCON_DELAY = parseInt(argAfter("--rcon-delay") || "0", 10);
+wl("Bootstrapping ...");
+setTimeout(() => wl("[Oxide] Loading extension Oxide.Rust"), 100);
+setTimeout(() => wl("Server startup complete"), 300);
+let _n = 0;
+setInterval(() => wl("tick " + ++_n), 400).unref();
+// unsolicited broadcast spam — the wrapper must NOT print these
+setInterval(() => { for (const c of clients) wsSend(c, { Identifier: 0, Message: "SPAMLINE console noise", Type: "Generic" }); }, 250).unref();
+setTimeout(() => {
+  server.listen(PORT, "127.0.0.1", () => wl("[rcon] listening on " + PORT));
+}, RCON_DELAY);
 
 process.stdin.setEncoding("utf8");
 let sb = "";
