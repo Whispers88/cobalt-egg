@@ -12,7 +12,8 @@ ok()   { echo "  ok: $1"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
-STARTUP_BASE='./RustDedicated -batchmode +server.identity \"rust\" +server.hostname \"My Cool Host\" $( [ -z ${MAP_URL} ] && printf %s "+server.worldsize \"3000\" +server.seed \"1234\"" || printf %s "+server.levelurl ${MAP_URL}" ) +rcon.web true'
+# mirrors the real egg startup: seed + map url come from env (WORLD_SEED / MAP_URL)
+STARTUP_BASE='./RustDedicated -batchmode +server.identity \"rust\" +server.hostname \"My Cool Host\" $( [ -z ${MAP_URL} ] && printf %s "+server.worldsize \"3000\" +server.seed \"${WORLD_SEED}\"" || printf %s "+server.levelurl ${MAP_URL}" ) +rcon.web true'
 
 new_home() {
   H="$(mktemp -d)"
@@ -27,7 +28,7 @@ run_ep() { # extra KEY=VAL pairs as args
   OUT="$(env COBALT_HOME="$H" COBALT_WRAPPER="$STUB" \
       AUTO_UPDATE=0 FRAMEWORK_UPDATE=0 VALIDATE=0 \
       PREFLIGHT_PORTCHECK=0 OOM_WATCH=0 DISK_MIN_FREE_MB=0 \
-      SERVER_IDENTITY=rust MAP_URL="" STARTUP="$STARTUP_BASE" \
+      SERVER_IDENTITY=rust MAP_URL="" WORLD_SEED=1234 STARTUP="$STARTUP_BASE" \
       "$@" bash "$EP" 2>&1)"
   RC=$?
 }
@@ -74,7 +75,8 @@ S1="$(cat "$H/.cobalt/seed")"
 printf 'map' > "$H/.cobalt/pending_wipe"
 run_ep WIPE_NEW_SEED="111,222,333"
 S2="$(cat "$H/.cobalt/seed")"
-check "csv rotation advances"         '[[ "$S1" == "222" && "$S2" == "333" ]]'
+check "csv rotation starts at first"  '[[ "$S1" == "111" && "$S2" == "222" ]]'
+check "seed substituted into argv"    'echo "$OUT" | grep -q "\"+server.seed\",\"222\""'
 
 echo "Scenario E: pin match skips steamcmd"
 new_home
@@ -205,6 +207,30 @@ OUT="$(env COBALT_HOME="$H" COBALT_WRAPPER="$STUB" PATH="$FAKEBIN2:$PATH" \
 check "boots anyway (exit 0)"            '[[ $RC -eq 0 ]]'
 check "kept existing install msg"        'echo "$OUT" | grep -q "keeping existing install"'
 check "existing carbon untouched"        '[[ "$(cat "$H/carbon/marker")" == "existing" ]]'
+
+echo "Scenario M: wipe custom map URL (single + csv rotation)"
+new_home
+mkdir -p "$H/server/rust"
+printf 'map' > "$H/.cobalt/pending_wipe"
+run_ep WIPE_MAP_URL="http://ex/m1.map"
+check "single map url written"        '[[ "$(cat "$H/.cobalt/mapurl")" == "http://ex/m1.map" ]]'
+check "levelurl in argv"              'echo "$OUT" | grep -q "\"+server.levelurl\",\"http://ex/m1.map\""'
+check "no worldsize with map url"     '! echo "$OUT" | grep -q "+server.worldsize"'
+# next boot (no wipe) still uses the wiped map
+run_ep
+check "map url persists next boot"    'echo "$OUT" | grep -q "\"+server.levelurl\",\"http://ex/m1.map\""'
+# csv rotation across two wipes
+new_home
+mkdir -p "$H/server/rust"
+printf 'map' > "$H/.cobalt/pending_wipe"; run_ep WIPE_MAP_URL="http://ex/a.map,http://ex/b.map"
+M1="$(cat "$H/.cobalt/mapurl")"
+printf 'map' > "$H/.cobalt/pending_wipe"; run_ep WIPE_MAP_URL="http://ex/a.map,http://ex/b.map"
+M2="$(cat "$H/.cobalt/mapurl")"
+check "map url rotates a->b"          '[[ "$M1" == "http://ex/a.map" && "$M2" == "http://ex/b.map" ]]'
+# empty WIPE_MAP_URL clears the override (revert to procedural)
+printf 'map' > "$H/.cobalt/pending_wipe"; run_ep WIPE_MAP_URL=""
+check "empty clears map override"     '[[ ! -f "$H/.cobalt/mapurl" ]]'
+check "reverts to procedural"         'echo "$OUT" | grep -q "+server.worldsize"'
 
 echo ""
 echo "Entrypoint tests: $PASS passed, $FAIL failed"

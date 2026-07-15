@@ -60,6 +60,8 @@ is `random` or a `csv,rotation,list`) swaps the seed.
 | `VALIDATE` | `0` | full checksum costs minutes; auto-forced once after rollback |
 | `PIN_BUILD` | — | seed a pin from the panel |
 | `WIPE_NEW_SEED` | `keep` | `random` or `seed,list,rotation` |
+| `WIPE_MAP_URL` | — | custom map on wipe: single URL or `url1,url2` rotated per wipe; empty = keep configured map |
+| `GAMEMODE` | `vanilla` | `vanilla`/`softcore`/`hardcore` (`in:` rule — dropdown on Pelican or with the dropdown addon, validated text box on stock Ptero) |
 | `SHUTDOWN_TIMEOUT_SEC` | `60` | save time before force-kill; big maps need it |
 | `UPDATE_CHECK_INTERVAL_SEC` | `3600` | update-available warning; 0 = off |
 | `SERVER_IDENTITY` | `rust` | wipes target `server/<identity>/` |

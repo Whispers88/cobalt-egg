@@ -191,12 +191,12 @@
     },
     {
       "name": "Gamemode",
-      "description": "vanilla, softcore, or hardcore.",
+      "description": "Rust gamemode.",
       "env_variable": "GAMEMODE",
       "default_value": "vanilla",
       "user_viewable": true,
       "user_editable": true,
-      "rules": "nullable|string",
+      "rules": "required|in:vanilla,softcore,hardcore",
       "field_type": "text"
     },
     {
@@ -274,6 +274,16 @@
       "description": "Seed handling after a wipe: keep, random, or a comma-separated rotation list.",
       "env_variable": "WIPE_NEW_SEED",
       "default_value": "keep",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Wipe Map URL(s)",
+      "description": "Custom map applied on wipe. A single URL, or a comma-separated list rotated one per wipe. Empty = keep the configured map (procedural or Custom Map URL). Overrides Custom Map URL when set.",
+      "env_variable": "WIPE_MAP_URL",
+      "default_value": "",
       "user_viewable": true,
       "user_editable": true,
       "rules": "nullable|string",

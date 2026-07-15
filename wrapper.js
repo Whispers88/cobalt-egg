@@ -87,12 +87,24 @@ function wline(msg, color) {
 const werr = (msg) => wline(msg, C.red);
 
 // game/log lines: stdout only (they already live in unity.log)
+// Colour scheme (v1: oxide=magenta, carbon=cyan, errors=red, normal=green) plus
+// semantic highlights. Forced on unless NO_COLOR — v1 gated on isTTY, which is
+// false under Wings' pipe, so v1 showed NO colour in the panel; v2 always does.
+function colorForLine(t, isErr) {
+  if (isErr) return C.red;
+  if (/\b(error|exception|failed|failure|fatal|traceback|denied|refused)\b/.test(t)) return C.red;
+  if (/\b(warn|warning|deprecat)/.test(t)) return C.yellow;
+  if (/\bsav(e|ed|ing)\b|writing save|\bbackup\b/.test(t)) return C.yellow;
+  if (/joined|connected|has entered|approved|authenticated/.test(t)) return C.green;
+  if (/disconnect|has left|kicked|banned|timed out/.test(t)) return C.yellow;
+  return C.green;
+}
 function gline(ln, isErr) {
   const t = ln.toLowerCase();
   const tag = t.includes("oxide") || t.includes("umod") ? "[oxide]"
     : t.includes("carbon") ? "[carbon]" : "";
   const color = tag === "[oxide]" ? C.magenta : tag === "[carbon]" ? C.cyan
-    : isErr ? C.red : C.green;
+    : colorForLine(t, isErr);
   process.stdout.write(`${C.dim}${hhmm()}${C.reset} ${color}${tag ? tag + " " : ""}${ln}${C.reset}\n`);
 }
 

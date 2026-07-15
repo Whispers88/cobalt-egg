@@ -39,6 +39,17 @@ jget() { # jget <file> <accessor>  — path via argv so it survives any platform
   "$NODE_BIN" -e "const o=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));console.log(new Function('o','return o'+process.argv[2])(o))" "$1" "$2"
 }
 
+rotate_csv() { # <csv> <idx-file> -> print next item (trimmed), advance idx. Single item = constant.
+  local csv="$1" idxf="$2" idx=-1
+  IFS=',' read -ra _ITEMS <<< "$csv"
+  [[ -f "$idxf" ]] && idx="$(cat "$idxf" 2>/dev/null || echo -1)"
+  idx=$(( (idx + 1) % ${#_ITEMS[@]} ))
+  printf '%s' "$idx" > "$idxf"
+  local it="${_ITEMS[$idx]}"
+  it="${it#"${it%%[![:space:]]*}"}"; it="${it%"${it##*[![:space:]]}"}"  # trim spaces
+  printf '%s' "$it"
+}
+
 # ---------- .pteroignore (shrink panel backups by GB) ----------
 if [[ ! -f "$CH/.pteroignore" ]]; then
   cat > "$CH/.pteroignore" <<'EOF'
@@ -80,6 +91,7 @@ CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 SERVER_IDENTITY="${SERVER_IDENTITY:-rust}"
 PRESERVE_DIRS="${PRESERVE_DIRS:-oxide,carbon,cfg,Configs,plugins,Carbon,oxide.config.json,server,.cobalt,steamcmd,Steam,.steam,steamapps}"
 WIPE_NEW_SEED="${WIPE_NEW_SEED:-keep}"
+WIPE_MAP_URL="${WIPE_MAP_URL:-}"
 
 DEFAULT_STEAM_BRANCH=""
 case "${FRAMEWORK}" in
@@ -280,18 +292,22 @@ if [[ -f "$PW" ]]; then
   else
     warn "wipe: ${IDDIR} does not exist — nothing to wipe."
   fi
-  # seed rotation (only when WIPE_NEW_SEED != keep)
+  # seed rotation
   if [[ "$WIPE_NEW_SEED" == "random" ]]; then
     printf '%s' "$(( (RANDOM<<16) ^ (RANDOM<<1) ^ $$ ))" > "$COBALT_DIR/seed"
     log "wipe: new random seed $(cat "$COBALT_DIR/seed")"
   elif [[ "$WIPE_NEW_SEED" != "keep" && -n "$WIPE_NEW_SEED" ]]; then
-    IFS=',' read -ra SEEDS <<< "$WIPE_NEW_SEED"
-    idx=0
-    [[ -f "$COBALT_DIR/seed_idx" ]] && idx=$(cat "$COBALT_DIR/seed_idx" 2>/dev/null || echo 0)
-    idx=$(( (idx + 1) % ${#SEEDS[@]} ))
-    printf '%s' "$idx" > "$COBALT_DIR/seed_idx"
-    printf '%s' "${SEEDS[$idx]}" > "$COBALT_DIR/seed"
+    rotate_csv "$WIPE_NEW_SEED" "$COBALT_DIR/seed_idx" > "$COBALT_DIR/seed"
     log "wipe: rotated seed -> $(cat "$COBALT_DIR/seed")"
+  else
+    rm -f "$COBALT_DIR/seed" "$COBALT_DIR/seed_idx"   # keep -> revert to panel WORLD_SEED
+  fi
+  # custom map URL: single string, or comma list rotated each wipe; empty = leave map as configured
+  if [[ -n "$WIPE_MAP_URL" ]]; then
+    rotate_csv "$WIPE_MAP_URL" "$COBALT_DIR/mapurl_idx" > "$COBALT_DIR/mapurl"
+    log "wipe: map URL -> $(cat "$COBALT_DIR/mapurl")"
+  else
+    rm -f "$COBALT_DIR/mapurl" "$COBALT_DIR/mapurl_idx"
   fi
   rm -f "$PW"
 fi
@@ -478,6 +494,11 @@ fi
 # ============================================================================
 # build argv
 # ============================================================================
+# Wipe rotations override via env BEFORE expansion, so the STARTUP conditional
+# naturally swaps procedural<->levelurl and substitutes the rotated seed.
+if [[ -f "$COBALT_DIR/seed" ]];   then export WORLD_SEED="$(cat "$COBALT_DIR/seed")";   log "Seed override (wipe): ${WORLD_SEED}"; fi
+if [[ -f "$COBALT_DIR/mapurl" ]]; then export MAP_URL="$(cat "$COBALT_DIR/mapurl")";     log "Map URL override (wipe): ${MAP_URL}"; fi
+
 if [[ "$#" -gt 0 ]]; then
   ARGV=( "$@" )
 else
@@ -487,17 +508,6 @@ else
   ARGV=( "$@" )
 fi
 if [[ "${#ARGV[@]}" -gt 0 && "${ARGV[0]}" == "/entrypoint.sh" ]]; then ARGV=( "${ARGV[@]:1}" ); fi
-
-# seed override (written by wipe rotation; only exists when WIPE_NEW_SEED != keep)
-if [[ -f "$COBALT_DIR/seed" ]]; then
-  NEWSEED="$(cat "$COBALT_DIR/seed")"
-  for i in "${!ARGV[@]}"; do
-    if [[ "${ARGV[$i]}" == "+server.seed" && $((i+1)) -lt "${#ARGV[@]}" ]]; then
-      ARGV[$((i+1))]="$NEWSEED"
-      log "Seed overridden by wipe rotation: ${NEWSEED}"
-    fi
-  done
-fi
 
 # ---------- binary checks ----------
 if [[ ! -f "$CH/RustDedicated" ]]; then

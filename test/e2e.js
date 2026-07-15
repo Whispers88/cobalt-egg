@@ -34,15 +34,17 @@ function writeAcf(h, buildid) {
 }
 
 class Run {
-  constructor(home, { pass = "testpass", envExtra = {}, mockArgs = [] } = {}) {
+  constructor(home, { pass = "testpass", envExtra = {}, mockArgs = [], color = false } = {}) {
     this.port = portCounter++;
     this.out = "";
     const args = [WRAPPER, "--argv", NODE, MOCK,
       "-logfile", path.join(home, "unity.log"),
       "+rcon.port", String(this.port), "+rcon.password", "testpass", ...mockArgs];
+    const baseEnv = { ...process.env, COBALT_HOME: home };
+    if (color) delete baseEnv.NO_COLOR; else baseEnv.NO_COLOR = "1";
     this.p = spawn(NODE, args, {
       env: {
-        ...process.env, NO_COLOR: "1", COBALT_HOME: home,
+        ...baseEnv,
         RCON_HOST: "127.0.0.1", RCON_PORT: String(this.port), RCON_PASS: pass,
         SHUTDOWN_TIMEOUT_SEC: "15", UPDATE_CHECK_INTERVAL_SEC: "0", TELEMETRY_INTERVAL_SEC: "0",
         ...envExtra,
@@ -212,10 +214,25 @@ async function test4_rollbackStaging() {
   ok("rollback run shuts down cleanly");
 }
 
+async function test5_colours() {
+  console.log("test 5: console colours (ANSI on when NO_COLOR unset)");
+  const home = mkHome();
+  writeAcf(home, 11111);
+  const r = new Run(home, { color: true });
+  await r.waitFor(/Loading extension Oxide/);
+  await sleep(200);
+  assert(/\x1b\[35m/.test(r.out), "expected magenta ([oxide]) ANSI in coloured output");
+  assert(/\x1b\[/.test(r.out), "expected ANSI colour codes when NO_COLOR unset");
+  ok("ANSI colours emitted (oxide=magenta) with colour enabled");
+  r.send("quit");
+  await r.waitExit();
+}
+
 (async () => {
   await test1_happyPath();
   await test2_stdinFallback();
   await test3_escalation();
   await test4_rollbackStaging();
+  await test5_colours();
   console.log(`\nE2E: all ${passed} checks passed`);
 })().catch((e) => { console.error("\nE2E FAILED:", e.message); process.exit(1); });
