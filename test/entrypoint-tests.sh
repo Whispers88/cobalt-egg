@@ -151,6 +151,61 @@ rm -f "$H/RustDedicated"
 run_ep
 check "missing RustDedicated -> exit 13" '[[ $RC -eq 13 ]]'
 
+echo "Scenario K: carbon-staging framework install (fake curl; staging has only Debug)"
+new_home
+# fake curl: 404 everything except Carbon.Linux.Debug.tar.gz, log requested URLs
+FAKEBIN="$(mktemp -d)"
+CURLLOG="$H/.cobalt/curl.log"
+cat > "$FAKEBIN/curl" <<'FAKE'
+#!/bin/bash
+out=""; url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    http*|https*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+echo "$url" >> "$CURLLOG"
+if [[ "$url" == *Carbon.Linux.Debug.tar.gz ]]; then
+  t="$(mktemp -d)"; mkdir -p "$t/carbon"; echo staging > "$t/carbon/marker"
+  tar -czf "$out" -C "$t" carbon; rm -rf "$t"; exit 0
+fi
+exit 22
+FAKE
+chmod +x "$FAKEBIN/curl"
+OUT="$(env COBALT_HOME="$H" COBALT_WRAPPER="$STUB" PATH="$FAKEBIN:$PATH" CURLLOG="$CURLLOG" \
+    AUTO_UPDATE=0 FRAMEWORK_UPDATE=1 VALIDATE=0 FRAMEWORK=carbon-staging \
+    PREFLIGHT_PORTCHECK=0 OOM_WATCH=0 DISK_MIN_FREE_MB=0 \
+    SERVER_IDENTITY=rust MAP_URL="" STARTUP="$STARTUP_BASE" \
+    bash "$EP" 2>&1)"; RC=$?
+check "exit 0"                          '[[ $RC -eq 0 ]]'
+check "used CarbonCommunity/Carbon repo" 'grep -q "CarbonCommunity/Carbon" "$CURLLOG"'
+check "used rustbeta_staging_build tag"  'grep -q "rustbeta_staging_build" "$CURLLOG"'
+check "tried Release first"              'head -1 "$CURLLOG" | grep -q "Carbon.Linux.Release.tar.gz"'
+check "fell back to Debug"               'grep -q "Carbon.Linux.Debug.tar.gz" "$CURLLOG"'
+check "carbon/ extracted"                '[[ -f "$H/carbon/marker" ]]'
+check "artifact archived"                'ls "$H/.cobalt/frameworks/"carbon-rustbeta_staging_build-*.tar.gz >/dev/null 2>&1'
+check "last_install framework recorded"  'grep -q "carbon-staging" "$H/.cobalt/last_install"'
+
+echo "Scenario L: carbon-staging download fails but existing install is kept"
+new_home
+mkdir -p "$H/carbon"; echo existing > "$H/carbon/marker"   # pretend Carbon already installed
+FAKEBIN2="$(mktemp -d)"
+cat > "$FAKEBIN2/curl" <<'FAKE'
+#!/bin/bash
+exit 22
+FAKE
+chmod +x "$FAKEBIN2/curl"
+OUT="$(env COBALT_HOME="$H" COBALT_WRAPPER="$STUB" PATH="$FAKEBIN2:$PATH" \
+    AUTO_UPDATE=0 FRAMEWORK_UPDATE=1 VALIDATE=0 FRAMEWORK=carbon-staging \
+    PREFLIGHT_PORTCHECK=0 OOM_WATCH=0 DISK_MIN_FREE_MB=0 \
+    SERVER_IDENTITY=rust MAP_URL="" STARTUP="$STARTUP_BASE" \
+    bash "$EP" 2>&1)"; RC=$?
+check "boots anyway (exit 0)"            '[[ $RC -eq 0 ]]'
+check "kept existing install msg"        'echo "$OUT" | grep -q "keeping existing install"'
+check "existing carbon untouched"        '[[ "$(cat "$H/carbon/marker")" == "existing" ]]'
+
 echo ""
 echo "Entrypoint tests: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

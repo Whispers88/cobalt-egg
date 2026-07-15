@@ -386,34 +386,50 @@ install_oxide() {
   good "Oxide ${ver} installed (artifact archived)."
 }
 
+# Carbon uses ROLLING tags on CarbonCommunity/Carbon (NOT /releases/latest/ —
+# that only ever resolves to production_build, the sole non-prerelease). The
+# per-channel tag + which Linux asset it actually ships:
+carbon_tag() {
+  case "$1" in
+    carbon-edge* )    echo "edge_build" ;;
+    carbon-staging* ) echo "rustbeta_staging_build" ;;
+    carbon-aux1* )    echo "rustbeta_aux01_build" ;;
+    carbon-aux2* )    echo "rustbeta_aux02_build" ;;
+    * )               echo "production_build" ;;
+  esac
+}
+# Ordered asset candidates. Beta tags (edge/staging) ship only Debug, stable
+# tags ship Release — so try Release then fall back to Debug and one wins.
+carbon_assets() {
+  if [[ "$1" == *"-minimal" ]]; then echo "Carbon.Linux.Minimal.tar.gz"
+  else echo "Carbon.Linux.Release.tar.gz Carbon.Linux.Debug.tar.gz"; fi
+}
+
 install_carbon() {
-  local channel="production" minimal="" url=""
-  case "${FRAMEWORK}" in
-    carbon-edge* )    channel="edge" ;;
-    carbon-staging* ) channel="staging" ;;
-    carbon-aux1* )    channel="aux1" ;;
-    carbon-aux2* )    channel="aux2" ;;
-  esac
-  [[ "${FRAMEWORK}" == *"-minimal" ]] && minimal=".Minimal"
-  case "$channel" in
-    production) url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Release${minimal}.tar.gz" ;;
-    edge)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Edge${minimal}.tar.gz" ;;
-    staging)    url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Staging${minimal}.tar.gz" ;;
-    aux1)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux1${minimal}.tar.gz" ;;
-    aux2)       url="https://github.com/Carbon-Modding/Carbon.Core/releases/latest/download/Carbon.Linux.Aux2${minimal}.tar.gz" ;;
-  esac
-  log "Installing Carbon (${channel}${minimal:+ minimal})…"
-  local tmp; tmp="$(mktemp -d)"
-  # capture the post-redirect URL — the release tag is the version
-  local eff; eff="$(curl -fSL --retry 5 -o "$tmp/carbon.tar.gz" -w '%{url_effective}' "$url")"
-  local ver; ver="$(printf '%s' "$eff" | sed -n 's|.*/download/\([^/]*\)/.*|\1|p')"
-  [[ -z "$ver" ]] && ver="${channel}-$(date +%F)"
-  local art="$COBALT_DIR/frameworks/carbon-${ver//\//_}${minimal}.tar.gz"
+  local tag; tag="$(carbon_tag "$FRAMEWORK")"
+  local base="${CARBON_BASE:-https://github.com/CarbonCommunity/Carbon/releases/download}/${tag}"
+  local tmp; tmp="$(mktemp -d)" got=""
+  for asset in $(carbon_assets "$FRAMEWORK"); do
+    log "Fetching Carbon ${tag}/${asset}…"
+    if curl -fSL --retry 3 -o "$tmp/carbon.tar.gz" "${base}/${asset}"; then got="$asset"; break; fi
+    warn "  ${asset} not available for ${tag}; trying next…"
+  done
+  if [[ -z "$got" ]]; then
+    rm -rf "$tmp"
+    if [[ -d "$CH/carbon" ]]; then
+      warn "Carbon download failed for tag '${tag}' — keeping existing install and continuing."
+      return 0
+    fi
+    bad "Carbon download failed for tag '${tag}' (FRAMEWORK=${FRAMEWORK}). Invalid channel or GitHub unreachable."
+    exit 10
+  fi
+  local ver="${tag}-$(date +%F)"
+  local art="$COBALT_DIR/frameworks/carbon-${tag}-$(date +%Y%m%d).tar.gz"
   cp "$tmp/carbon.tar.gz" "$art"
   tar -xzf "$tmp/carbon.tar.gz" -C "$CH"
   rm -rf "$tmp"
   write_last_install "${FRAMEWORK}" "$ver" "$art"
-  good "Carbon ${ver} installed (artifact archived)."
+  good "Carbon installed from ${tag}/${got} (artifact archived)."
 }
 
 install_from_custom_url() {
