@@ -1,938 +1,551 @@
 #!/usr/bin/env node
-
+"use strict";
 // ============================================================================
-// Rust wrapper — PTY-aware, argv-safe, logfile mirroring, panel->RCON/STDIN shim
-// - If starting in CONSOLE_MODE=stdin: run Rust directly so STDIN works
-// - If starting in rcon/auto: prefers launching via `script -qefc` for PTY
-// - Uses `stdbuf -oL -eL` (if present) for line-buffered output
-// - Pretty console formatting; mirrors raw to latest.log; tails -logfile if present
-// - Panel input:
-//     * "! <cmd>"      => run shell in container
-//     * "stdin: <x>"   => send to Rust STDIN (console)
-//     * "console: <x>" => alias of stdin
-//     * "rcon: <x>"    => send via RCON (legacy or Web, based on RCON_MODE)
-//     * default route  => CONSOLE_MODE=stdin|rcon|auto (auto = rcon if RCON_PASS set)
-//     * ".stack"       => use gdb to dump RustDedicated backtrace
-//     * ".telemetry"   => print current CPU/memory/load
-//     * ".heap"        => print detailed Node heap usage
-// - `.mode stdin|rcon|auto` switches default at runtime
-// - RCON_MODE=legacy|web selects legacy RCON or WebRCON
+// Cobalt wrapper 2.0 — logfile-read + WebRCON-send
+//
+//   read  = tail -F the Unity -logfile (injected into argv if missing).
+//           Unity with -logfile writes nothing to stdout; the tail IS the console.
+//   send  = one persistent WebRCON client (native WebSocket, Node >= 22).
+//           Rust WebRCON broadcasts ALL console output to every client, so we
+//           print ONLY responses whose Identifier matches a command we sent —
+//           anything unsolicited would 100%-duplicate the logfile stream.
+//   stop  = "quit" (Wings stop cmd) / SIGTERM / SIGINT ->
+//           rcon quit -> (rcon down? stdin quit) -> SIGTERM -> SIGKILL,
+//           waiting SHUTDOWN_TIMEOUT_SEC (default 60) for the save to finish.
+//
+// Panel input:
+//   ! <sh>                  run shell in container
+//   .help                   list commands
+//   .version                installed build + framework + pin + catalog
+//   .pin [buildid]          freeze updates on current (or given) build
+//   .unpin                  resume updates on next boot
+//   .rollback <build|last>  stage rollback (download now, applied at next boot)
+//   .wipe map               pending map wipe (next boot)
+//   .wipe full confirm      pending full/BP wipe (token required)
+//   .telemetry              game CPU/RSS + loadavg + disk
+//   .stdin <x>              write to game stdin (ALLOW_STDIN=1 only)
+//   rcon: <x>               explicit rcon send
+//   <anything else>         rcon send
 // ============================================================================
 
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
-const net = require("net");
+const path = require("path");
 const os = require("os");
 
-// Optional WebSocket client for WebRCON mode
-let WebSocket = null;
-try {
-  WebSocket = require("ws");
-} catch {
-  // only required for RCON_MODE=web
-}
-
 // ---------- config ----------
-const LATEST_LOG = process.env.LATEST_LOG || "/home/container/latest.log";
+const HOME = process.env.COBALT_HOME || "/home/container";
+const COBALT_DIR = process.env.COBALT_DIR || path.join(HOME, ".cobalt");
+const UNITY_LOG = process.env.UNITY_LOG || path.join(HOME, "unity.log");
+const COBALT_LOG = process.env.COBALT_LOG || path.join(HOME, "cobalt.log");
+const APPID = process.env.SRCDS_APPID || "258550";
+const ACF = path.join(HOME, "steamapps", `appmanifest_${APPID}.acf`);
+
 const RCON_HOST = process.env.RCON_HOST || "127.0.0.1";
 const RCON_PORT = parseInt(process.env.RCON_PORT || "28016", 10);
 const RCON_PASS = process.env.RCON_PASS || "";
-const RCON_MODE = (process.env.RCON_MODE || "legacy").toLowerCase(); // legacy | web
 
-const initialMode = (process.env.CONSOLE_MODE || "auto").toLowerCase();
-const COLOR_OK = process.stdout.isTTY && !("NO_COLOR" in process.env);
+const SHUTDOWN_TIMEOUT_SEC = parseInt(process.env.SHUTDOWN_TIMEOUT_SEC || "60", 10);
+const TELEMETRY_INTERVAL_SEC = parseInt(process.env.TELEMETRY_INTERVAL_SEC || "0", 10);
+const UPDATE_CHECK_INTERVAL_SEC = parseInt(process.env.UPDATE_CHECK_INTERVAL_SEC || "3600", 10);
+const ALLOW_STDIN = process.env.ALLOW_STDIN === "1";
 
-// Telemetry every N ms (0 = disabled)
-const TELEMETRY_INTERVAL_MS = parseInt(
-  process.env.TELEMETRY_INTERVAL_MS || "60000",
-  10,
-);
+const CATALOG = path.join(COBALT_DIR, "versions.json");
+const PIN_FILE = path.join(COBALT_DIR, "pin");
+const PENDING_WIPE = path.join(COBALT_DIR, "pending_wipe");
+const PENDING_ROLLBACK = path.join(COBALT_DIR, "pending_rollback");
+const LAST_INSTALL = path.join(COBALT_DIR, "last_install");
+const FRAMEWORKS_DIR = path.join(COBALT_DIR, "frameworks");
+const CATALOG_MAX = 20;
 
-// ---------- colors ----------
-const C = COLOR_OK
-  ? {
-      reset: "\x1b[0m",
-      dim: "\x1b[2m",
-      fg: {
-        red: "\x1b[31m",
-        green: "\x1b[32m",
-        yellow: "\x1b[33m",
-        cyan: "\x1b[36m",
-        magenta: "\x1b[35m",
-        white: "\x1b[37m",
-      },
-    }
-  : {
-      reset: "",
-      dim: "",
-      fg: { red: "", green: "", yellow: "", cyan: "", magenta: "", white: "" },
-    };
+// ---------- colors (panel renders ANSI; NO_COLOR to disable) ----------
+const COLOR = !("NO_COLOR" in process.env);
+const C = COLOR
+  ? { reset: "\x1b[0m", dim: "\x1b[2m", red: "\x1b[31m", green: "\x1b[32m",
+      yellow: "\x1b[33m", cyan: "\x1b[36m", magenta: "\x1b[35m", white: "\x1b[37m" }
+  : { reset: "", dim: "", red: "", green: "", yellow: "", cyan: "", magenta: "", white: "" };
 
-// ---------- helpers ----------
+// ---------- output ----------
 const hhmm = () => {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, "0");
+  const d = new Date(), p = (n) => String(n).padStart(2, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}`;
 };
 
-const looksLikeFlag = (s) =>
-  typeof s === "string" && /^[-+][A-Za-z0-9_.-]+$/.test(s);
+fs.mkdirSync(COBALT_DIR, { recursive: true });
+fs.mkdirSync(FRAMEWORKS_DIR, { recursive: true });
+try { // rotate cobalt.log if large
+  if (fs.existsSync(COBALT_LOG) && fs.statSync(COBALT_LOG).size > 5 * 1024 * 1024)
+    fs.renameSync(COBALT_LOG, `${COBALT_LOG}.prev`);
+} catch {}
+const cobaltLog = fs.createWriteStream(COBALT_LOG, { flags: "a" });
 
+// wrapper's own events: stdout + cobalt.log
+function wline(msg, color) {
+  process.stdout.write(`${C.dim}${hhmm()}${C.reset} ${color || ""}${msg}${color ? C.reset : ""}\n`);
+  cobaltLog.write(`${hhmm()} ${msg.replace(/\x1b\[[0-9;]*m/g, "")}\n`);
+}
+const werr = (msg) => wline(msg, C.red);
+
+// game/log lines: stdout only (they already live in unity.log)
+function gline(ln, isErr) {
+  const t = ln.toLowerCase();
+  const tag = t.includes("oxide") || t.includes("umod") ? "[oxide]"
+    : t.includes("carbon") ? "[carbon]" : "";
+  const color = tag === "[oxide]" ? C.magenta : tag === "[carbon]" ? C.cyan
+    : isErr ? C.red : C.green;
+  process.stdout.write(`${C.dim}${hhmm()}${C.reset} ${color}${tag ? tag + " " : ""}${ln}${C.reset}\n`);
+}
+
+// ---------- helpers ----------
+const readText = (f) => { try { return fs.readFileSync(f, "utf8").trim(); } catch { return null; } };
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
+const writeJson = (f, o) => fs.writeFileSync(f, JSON.stringify(o, null, 2));
+
+function acfInfo() {
+  const txt = readText(ACF);
+  if (!txt) return null;
+  const b = txt.match(/"buildid"\s+"(\d+)"/);
+  const depots = [];
+  const re = /"(\d+)"\s*\{\s*"manifest"\s+"(\d+)"/g;
+  let m;
+  while ((m = re.exec(txt))) depots.push({ id: m[1], manifest: m[2] });
+  return { buildid: b ? parseInt(b[1], 10) : 0, depots };
+}
+
+function steamcmdCmd() {
+  const p = process.env.COBALT_STEAMCMD ||
+    [path.join(HOME, "steamcmd", "steamcmd.sh"), "/usr/games/steamcmd", "/usr/bin/steamcmd"].find((f) => fs.existsSync(f));
+  if (!p) return null;
+  // .js steamcmd = test fake, run through node
+  return p.endsWith(".js") ? { cmd: process.execPath, pre: [p] } : { cmd: p, pre: [] };
+}
+
+function resolveRustPid() {
+  try {
+    for (const name of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        if (fs.readFileSync(`/proc/${name}/comm`, "utf8").trim() === "RustDedicated")
+          return parseInt(name, 10);
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+// ---------- argv (single format: --argv <exe> <args...>) ----------
+const looksLikeFlag = (s) => typeof s === "string" && /^[-+][A-Za-z0-9_.+-]+$/.test(s);
 const SWITCH_ONLY = new Set(["-batchmode", "-nographics", "-nolog", "-no-gui"]);
 
-const which = (bin) => {
-  try {
-    return execSync(`command -v ${bin}`, {
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .toString()
-      .trim();
-  } catch {
-    return "";
-  }
-};
-
-const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-
+// Pterodactyl splits quoted values into separate argv tokens; re-join them.
 function repairSplitArgs(params) {
   const out = [];
-  for (let i = 0; i < params.length; ) {
+  for (let i = 0; i < params.length;) {
     const tok = String(params[i]);
     if (looksLikeFlag(tok)) {
-      out.push(tok);
-      i++;
+      out.push(tok); i++;
       if (SWITCH_ONLY.has(tok)) continue;
-
       if (i < params.length) {
         let val = String(params[i++]);
-        while (i < params.length && !looksLikeFlag(params[i])) {
-          val += " " + String(params[i++]);
-        }
+        while (i < params.length && !looksLikeFlag(params[i])) val += " " + String(params[i++]);
         out.push(val);
       }
-    } else {
-      out.push(tok);
-      i++;
-    }
+    } else { out.push(tok); i++; }
   }
   return out;
 }
 
-function tagForLine(s) {
-  const t = s.toLowerCase();
-  if (t.includes("oxide") || t.includes("umod")) return "[oxide]";
-  if (t.includes("carbon")) return "[carbon]";
-  return "";
-}
-
-// ---------- log file setup ----------
-try {
-  if (fs.existsSync(LATEST_LOG)) {
-    fs.renameSync(LATEST_LOG, `${LATEST_LOG}.prev`);
-  }
-} catch {}
-
-try {
-  fs.writeFileSync(LATEST_LOG, "", { flag: "w" });
-} catch {}
-
-// ---------- argv decode ----------
-const argv = process.argv.slice(2);
-
-function decodeArgv() {
-  let i = argv.indexOf("--argv-json");
-  if (i !== -1 && argv[i + 1]) {
-    try {
-      const arr = JSON.parse(argv[i + 1]);
-      if (!Array.isArray(arr) || !arr.length) throw 0;
-      return arr.map(String);
-    } catch {
-      console.error(
-        `${hhmm()} ERROR: --argv-json must be a JSON array of strings.`,
-      );
-      process.exit(1);
-    }
-  }
-
-  i = argv.indexOf("--argv-b64");
-  if (i !== -1 && argv[i + 1]) {
-    try {
-      const json = Buffer.from(argv[i + 1], "base64").toString("utf8");
-      const arr = JSON.parse(json);
-      if (!Array.isArray(arr) || !arr.length) throw 0;
-      return arr.map(String);
-    } catch {
-      console.error(
-        `${hhmm()} ERROR: --argv-b64 must be base64 of a JSON array of strings.`,
-      );
-      process.exit(1);
-    }
-  }
-
-  i = argv.indexOf("--argv-file");
-  if (i !== -1 && argv[i + 1]) {
-    try {
-      const buf = fs.readFileSync(argv[i + 1]);
-      let parts = buf
-        .toString("utf8")
-        .split("\0")
-        .filter(Boolean);
-      if (parts.length <= 1)
-        parts = buf
-          .toString("utf8")
-          .split(/\r?\n/)
-          .filter(Boolean);
-      if (!parts.length) throw new Error("empty argv file");
-      return parts.map(String);
-    } catch (e) {
-      console.error(
-        `${hhmm()} ERROR: --argv-file must be readable: ${e.message || e}`,
-      );
-      process.exit(1);
-    }
-  }
-
-  if (process.env.RUST_ARGS_JSON) {
-    try {
-      const arr = JSON.parse(process.env.RUST_ARGS_JSON);
-      if (!Array.isArray(arr) || !arr.length) throw 0;
-      return arr.map(String);
-    } catch {
-      console.error(
-        `${hhmm()} ERROR: RUST_ARGS_JSON must be a JSON array of strings.`,
-      );
-      process.exit(1);
-    }
-  }
-
-  const flagIndex = argv.indexOf("--argv");
-  if (flagIndex === -1) {
-    console.error(
-      `${hhmm()} ERROR: Missing argv source. Use --argv-file/--argv-json/--argv-b64 or legacy --argv.`,
-    );
-    process.exit(1);
-  }
-
-  const legacy = argv.slice(flagIndex + 1);
-  if (!legacy.length) {
-    console.error(
-      `${hhmm()} ERROR: No arguments provided for RustDedicated.`,
-    );
-    process.exit(1);
-  }
-  return legacy.map(String);
-}
-
-const fullArgv = decodeArgv();
-const executable = fullArgv[0];
-let params = fullArgv.slice(1);
-params = repairSplitArgs(params);
-
-if (!executable) {
-  console.error(
-    `${hhmm()} ERROR: First argv element must be the RustDedicated binary.`,
-  );
+const rawArgv = process.argv.slice(2);
+const flagIdx = rawArgv.indexOf("--argv");
+if (flagIdx === -1 || !rawArgv[flagIdx + 1]) {
+  console.error(`${hhmm()} ERROR: usage: wrapper.js --argv <RustDedicated> <args...>`);
   process.exit(1);
 }
+const fullArgv = rawArgv.slice(flagIdx + 1).map(String);
+const executable = fullArgv[0];
+let params = repairSplitArgs(fullArgv.slice(1));
 
-// ---------- run line ----------
-const CONSOLE_MODE = (() => {
-  let m = initialMode;
-  if (m !== "stdin" && m !== "rcon" && m !== "auto") m = "auto";
-  return m;
-})();
-process.env.CONSOLE_MODE = CONSOLE_MODE;
+// inject -logfile if missing — the logfile is our read channel
+if (!params.includes("-logfile")) {
+  params.push("-logfile", UNITY_LOG);
+}
+const unityLogfile = params[params.indexOf("-logfile") + 1] || UNITY_LOG;
 
+// ---------- log rotation (unity.log grows unbounded across week-long runs) ----------
+try { if (fs.existsSync(unityLogfile)) fs.renameSync(unityLogfile, `${unityLogfile}.prev`); } catch {}
+try { fs.closeSync(fs.openSync(unityLogfile, "a")); } catch {}
+
+// ---------- catalog record (runs every boot; entrypoint wrote last_install) ----------
+function recordCatalog() {
+  const acf = acfInfo();
+  if (!acf || !acf.buildid) return null;
+  const li = readJson(LAST_INSTALL) || {};
+  let cat = readJson(CATALOG);
+  if (!Array.isArray(cat)) cat = [];
+  const entry = {
+    buildid: acf.buildid,
+    depots: acf.depots,
+    framework: li.framework || "unknown",
+    frameworkVersion: li.version || "unknown",
+    frameworkArtifact: li.artifact || "",
+    recorded_at: new Date().toISOString(),
+  };
+  cat = [entry, ...cat.filter((e) => e.buildid !== acf.buildid)].slice(0, CATALOG_MAX);
+  try { writeJson(CATALOG, cat); } catch (e) { werr(`[cobalt] catalog write failed: ${e.message}`); }
+  // prune framework artifacts no catalog entry references
+  try {
+    const referenced = new Set(cat.map((e) => path.basename(e.frameworkArtifact || "")).filter(Boolean));
+    for (const f of fs.readdirSync(FRAMEWORKS_DIR))
+      if (!referenced.has(f)) fs.rmSync(path.join(FRAMEWORKS_DIR, f), { force: true });
+  } catch {}
+  return entry;
+}
+const bootEntry = recordCatalog();
+
+// ---------- spawn game (plain pipes; no PTY — stdout is near-silent with -logfile) ----------
 process.stdout.write(
   `${C.dim}${hhmm()}${C.reset} Executing: ${executable} ` +
-    params
-      .map((a) =>
-        /[^A-Za-z0-9_/.:-]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a,
-      )
-      .join(" ") +
-    `  [mode:${process.env.CONSOLE_MODE}]` +
-    "\n",
+  params.map((a) => (/[^A-Za-z0-9_/.:+-]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a)).join(" ") + "\n",
 );
+if (bootEntry)
+  wline(`[cobalt] build ${bootEntry.buildid} · ${bootEntry.framework} ${bootEntry.frameworkVersion}` +
+    (readText(PIN_FILE) ? " · PINNED" : ""), readText(PIN_FILE) ? C.yellow : undefined);
 
-// detect -logfile
-let unityLogfile = null;
-for (let i = 0; i < params.length; i++) {
-  if (params[i] === "-logfile" && i + 1 < params.length) {
-    unityLogfile = params[i + 1];
-    break;
-  }
+const game = spawn(executable, params, { stdio: ["pipe", "pipe", "pipe"], cwd: HOME, shell: false });
+
+// native-crash output etc. still arrives on the pipes; show it tagged
+const procBufs = { out: "", err: "" };
+function onProcData(chunk, isErr) {
+  const key = isErr ? "err" : "out";
+  const lines = (procBufs[key] + chunk.toString()).split(/\r?\n/);
+  procBufs[key] = lines.pop();
+  for (const ln of lines) if (ln.trim()) gline(`[proc] ${ln}`, isErr);
 }
+game.stdout.on("data", (d) => onProcData(d, false));
+game.stderr.on("data", (d) => onProcData(d, true));
 
-// ---------- pretty mirroring ----------
-const buffers = Object.create(null);
-
-function emitPretty(sourceKey, chunk, isErr = false) {
-  const key = sourceKey + (isErr ? ":err" : ":out");
-  const prev = buffers[key] || "";
-  const raw = chunk.toString();
-
-  try {
-    fs.appendFile(LATEST_LOG, raw.replace(/\r/g, ""), () => {});
-  } catch {}
-
-  const s = prev + raw;
-  const lines = s.split(/\r?\n/);
-  buffers[key] = lines.pop();
-
-  for (const ln of lines) {
-    const label = tagForLine(ln);
-    const color =
-      label === "[oxide]"
-        ? C.fg.magenta
-        : label === "[carbon]"
-          ? C.fg.cyan
-          : isErr
-            ? C.fg.red
-            : C.fg.green;
-    const out = `${C.dim}${hhmm()}${C.reset} ${
-      label ? label + " " : ""
-    }${ln}`;
-    (isErr ? process.stderr : process.stdout).write(
-      `${color}${out}${C.reset}\n`,
-    );
-  }
-}
-
-// ---------- spawn Rust with or without PTY ----------
-const scriptBin = which("script"); // util-linux
-const stdbufBin = which("stdbuf"); // coreutils
-
-// If we *start* in stdin mode, prefer a direct pipe so game.stdin is really Rust's stdin.
-const forcePlainStdin = initialMode === "stdin";
-
-let cmd;
-let args;
-
-// Build the real command to run (optionally prefixed with stdbuf)
-const realCmd = (() => {
-  const seq = [];
-  if (stdbufBin) seq.push(stdbufBin, "-oL", "-eL");
-  seq.push(executable, ...params);
-  return seq.map(shQuote).join(" ");
-})();
-
-if (scriptBin && !forcePlainStdin) {
-  // RCON / auto modes: run under a PTY: script -qefc "<realCmd>" /dev/null
-  cmd = scriptBin;
-  args = ["-qefc", realCmd, "/dev/null"];
-  process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} using PTY via 'script'${
-      stdbufBin ? " + stdbuf" : ""
-    }\n`,
-  );
-} else if (stdbufBin) {
-  // stdin mode (or no script): run RustDedicated directly, with stdbuf if available
-  cmd = stdbufBin;
-  args = ["-oL", "-eL", executable, ...params];
-  process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} running without PTY (using stdbuf)\n`,
-  );
-} else {
-  cmd = executable;
-  args = params;
-  process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} running plain (no script, no stdbuf)\n`,
-  );
-}
-
-const game = spawn(cmd, args, {
-  stdio: ["pipe", "pipe", "pipe"],
-  cwd: "/home/container",
-  shell: false,
+// ---------- tail the unity logfile (the console) ----------
+const tailProc = spawn("tail", ["-n", "+1", "-F", unityLogfile], { stdio: ["ignore", "pipe", "pipe"] });
+let tailBuf = "";
+tailProc.stdout.on("data", (d) => {
+  const lines = (tailBuf + d.toString()).split(/\r?\n/);
+  tailBuf = lines.pop();
+  for (const ln of lines) if (ln.length) gline(ln, false);
 });
+tailProc.stderr.on("data", () => {}); // "file truncated" notices etc.
+tailProc.on("error", (e) => werr(`[cobalt] tail failed: ${e.message} — console read channel dead`));
 
-game.stdout.on("data", (d) => emitPretty("game", d, false));
-game.stderr.on("data", (d) => emitPretty("game", d, true));
+// ---------- WebRCON (persistent, matched-response-only) ----------
+let ws = null, wsReady = false, backoff = 1000, nextId = 1;
+let announcedWaiting = false, exiting = false;
+const pendingResp = new Map(); // id -> { cmd, ts }
+const sendQueue = [];          // commands queued before rcon is up
+const QUEUE_MAX = 20;
 
-// tail unity -logfile
-let tailProc = null;
-if (unityLogfile) {
-  try {
-    fs.closeSync(fs.openSync(unityLogfile, "a"));
-  } catch {}
-
-  process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} Mirroring logfile: ${unityLogfile}\n`,
-  );
-  tailProc = spawn("tail", ["-n", "+1", "-F", unityLogfile], {
-    stdio: ["ignore", "pipe", "pipe"],
+function rconConnect() {
+  if (!RCON_PASS || exiting) return;
+  let sock;
+  try { sock = new WebSocket(`ws://${RCON_HOST}:${RCON_PORT}/${encodeURIComponent(RCON_PASS)}`); }
+  catch { return scheduleReconnect(); }
+  ws = sock;
+  sock.addEventListener("open", () => {
+    wsReady = true; backoff = 1000; announcedWaiting = false;
+    wline(`[rcon] connected (${RCON_HOST}:${RCON_PORT})`);
+    while (sendQueue.length && wsReady) rconSend(sendQueue.shift());
   });
-  const tailMirror = (d) => emitPretty("unity", d, false);
-  tailProc.stdout.on("data", tailMirror);
-  tailProc.stderr.on("data", tailMirror);
-} else {
-  process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} No -logfile specified; consider adding: -logfile /home/container/unity.log\n`,
-  );
+  sock.addEventListener("message", (ev) => {
+    if (typeof ev.data !== "string") return;
+    let obj; try { obj = JSON.parse(ev.data); } catch { return; }
+    // Rust WebRCON broadcasts everything; only print replies to OUR commands.
+    if (!pendingResp.has(obj.Identifier)) return;
+    pendingResp.delete(obj.Identifier);
+    const body = String(obj.Message ?? "").replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
+    for (const ln of body.split(/\r?\n/)) {
+      if (!ln.trim()) continue;
+      process.stdout.write(`${C.dim}${hhmm()}${C.reset} ${C.cyan}[rcon] ${ln}${C.reset}\n`);
+    }
+  });
+  sock.addEventListener("error", () => {});
+  sock.addEventListener("close", () => {
+    if (wsReady) wline("[rcon] disconnected");
+    wsReady = false; ws = null;
+    if (!exiting) scheduleReconnect();
+  });
 }
-
-// ---------- Telemetry helpers (CPU + memory + load) ----------
-let lastCpuUsage = process.cpuUsage();
-let lastCpuTime = Date.now();
-
-function computeCpuPercent() {
+function scheduleReconnect() {
+  if (exiting) return;
+  setTimeout(rconConnect, backoff).unref();
+  backoff = Math.min(backoff * 2, 30000);
+}
+function rconSend(cmd) {
+  if (!RCON_PASS) { werr("[rcon] disabled — RCON_PASS not set"); return false; }
+  if (!wsReady || !ws) {
+    if (sendQueue.length < QUEUE_MAX) {
+      sendQueue.push(cmd);
+      if (!announcedWaiting) { wline("[rcon] not connected yet — command queued"); announcedWaiting = true; }
+    } else werr("[rcon] queue full — command dropped");
+    return false;
+  }
   const now = Date.now();
-  const diff = process.cpuUsage(lastCpuUsage);
-  const elapsedMs = now - lastCpuTime;
-  lastCpuUsage = process.cpuUsage();
-  lastCpuTime = now;
-
-  if (elapsedMs <= 0) return 0;
-
-  const userMs = diff.user / 1000;
-  const sysMs = diff.system / 1000;
-  const totalMs = userMs + sysMs;
-  const cpuPercent = (totalMs / elapsedMs) * 100; // 100% = 1 core fully used
-  return cpuPercent;
+  for (const [id, e] of pendingResp) if (now - e.ts > 30000) pendingResp.delete(id);
+  const id = nextId++;
+  pendingResp.set(id, { cmd, ts: now });
+  try { ws.send(JSON.stringify({ Identifier: id, Message: cmd, Name: "Cobalt" })); return true; }
+  catch (e) { pendingResp.delete(id); werr(`[rcon] send failed: ${e.message}`); return false; }
 }
+rconConnect();
 
-function snapshotTelemetry() {
-  const mem = process.memoryUsage();
-  const cpuPercent = computeCpuPercent();
-  const load = os.loadavg(); // [1m, 5m, 15m]
-  return { mem, cpuPercent, load };
-}
-
-function printTelemetry(prefix) {
-  const { mem, cpuPercent, load } = snapshotTelemetry();
-  const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
-  const heapUsedMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
-  const heapTotalMb = (mem.heapTotal / 1024 / 1024).toFixed(1);
-  const loadStr = load.map((v) => v.toFixed(2)).join(", ");
-
-  process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} [${prefix}] cpu=${cpuPercent.toFixed(
-      1,
-    )}% rss=${rssMb}MB heap=${heapUsedMb}/${heapTotalMb}MB loadavg=${loadStr}\n`,
-  );
-}
-
-function printHeapDetails() {
-  const mem = process.memoryUsage();
-  const parts = [];
-  for (const [key, val] of Object.entries(mem)) {
-    const mb = (val / 1024 / 1024).toFixed(3);
-    parts.push(`${key}=${mb}MB`);
+// ---------- telemetry (the GAME's cpu/rss via /proc, not the wrapper's) ----------
+let lastStat = null; // { pid, total, at }
+function printTelemetry() {
+  const pid = resolveRustPid();
+  let cpuStr = "n/a", rssStr = "n/a";
+  if (pid) {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const parts = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const total = (parseInt(parts[11], 10) + parseInt(parts[12], 10)) / 100; // utime+stime @ 100Hz
+      const now = Date.now();
+      if (lastStat && lastStat.pid === pid) {
+        const pct = ((total - lastStat.total) / ((now - lastStat.at) / 1000)) * 100;
+        cpuStr = `${pct.toFixed(1)}%`;
+      } else cpuStr = "(sampling)";
+      lastStat = { pid, total, at: now };
+      const rss = /VmRSS:\s+(\d+) kB/.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"));
+      if (rss) rssStr = `${(parseInt(rss[1], 10) / 1024).toFixed(0)}MB`;
+    } catch {}
   }
-  process.stdout.write(
-    `${C.dim}${hhmm()}${C.reset} [heap] ${parts.join(" ")}\n`,
-  );
+  let disk = "n/a";
+  try { const s = fs.statfsSync(HOME); disk = `${((s.bavail * s.bsize) / 1024 ** 3).toFixed(1)}GB free`; } catch {}
+  const load = os.loadavg().map((v) => v.toFixed(2)).join(", ");
+  wline(`[telemetry] game cpu=${cpuStr} rss=${rssStr} loadavg=${load} disk=${disk}` +
+    (pid ? "" : " (RustDedicated pid not found)"));
 }
+if (TELEMETRY_INTERVAL_SEC > 0) setInterval(printTelemetry, TELEMETRY_INTERVAL_SEC * 1000).unref();
 
-// Periodic telemetry
-if (TELEMETRY_INTERVAL_MS > 0) {
-  setInterval(() => {
-    printTelemetry("telemetry");
-  }, TELEMETRY_INTERVAL_MS).unref();
-}
-
-// ---------- RCON helpers (persistent; legacy + optional WebRCON) ----------
-const SERVERDATA_AUTH = 3;
-const SERVERDATA_EXECCOMMAND = 2;
-
-function pkt(id, type, body) {
-  const b = Buffer.from(String(body), "utf8");
-  const len = 4 + 4 + b.length + 2;
-  const buf = Buffer.alloc(4 + len);
-  buf.writeInt32LE(len, 0);
-  buf.writeInt32LE(id, 4);
-  buf.writeInt32LE(type, 8);
-  b.copy(buf, 12);
-  buf.writeInt8(0, 12 + b.length);
-  buf.writeInt8(0, 13 + b.length);
-  return buf;
-}
-
-// --- legacy RCON (Source-style TCP) ---
-let rconSocket = null;
-let rconReady = false;
-
-function ensureLegacyRconConnection() {
-  return new Promise((resolve, reject) => {
-    if (!RCON_PASS) return reject(new Error("RCON_PASS not set"));
-
-    if (rconSocket && rconReady) return resolve(rconSocket);
-
-    if (rconSocket && !rconReady) {
-      let tries = 0;
-      const waitReady = () => {
-        if (rconReady && rconSocket) return resolve(rconSocket);
-        if (!rconSocket) return reject(new Error("RCON socket lost"));
-        if (tries++ > 40) return reject(new Error("RCON auth timeout"));
-        setTimeout(waitReady, 50);
-      };
-      return waitReady();
+// ---------- update watcher (warn-only; 2.1 will automate) ----------
+let warnedBuild = 0;
+function checkForUpdate() {
+  const sc = steamcmdCmd();
+  const acf = acfInfo();
+  if (!sc || !acf || !acf.buildid || exiting) return;
+  const p = spawn(sc.cmd, [...sc.pre, "+login", "anonymous", "+app_info_update", "1", "+app_info_print", APPID, "+quit"],
+    { stdio: ["ignore", "pipe", "ignore"] });
+  let out = "";
+  p.stdout.on("data", (d) => (out += d));
+  p.on("exit", () => {
+    const m = /"public"\s*\{\s*"buildid"\s+"(\d+)"/.exec(out);
+    if (!m) return;
+    const remote = parseInt(m[1], 10);
+    if (remote > acf.buildid && remote !== warnedBuild) {
+      warnedBuild = remote;
+      const pinned = readText(PIN_FILE);
+      werr(`[update] Rust build ${remote} is out (installed: ${acf.buildid}).` +
+        (pinned ? ` Server is PINNED to ${pinned} — .unpin + restart to update.` : " Restart to update."));
     }
-
-    const socket = net.createConnection(
-      { host: RCON_HOST, port: RCON_PORT },
-      () => {
-        try {
-          socket.write(pkt(1, SERVERDATA_AUTH, RCON_PASS));
-        } catch (e) {
-          return reject(e);
-        }
-      },
-    );
-
-    rconSocket = socket;
-    rconReady = false;
-
-    socket.on("data", () => {
-      if (!rconReady) {
-        rconReady = true;
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [rcon] legacy connection authed\n`,
-        );
-      }
-      // Ignore body; server logs output anyway.
-    });
-
-    socket.on("error", (e) => {
-      process.stdout.write(
-        `${C.fg.red}${hhmm()} [rcon] legacy socket error: ${e.message}${C.reset}\n`,
-      );
-      rconReady = false;
-      rconSocket = null;
-    });
-
-    socket.on("close", () => {
-      process.stdout.write(
-        `${C.dim}${hhmm()}${C.reset} [rcon] legacy connection closed\n`,
-      );
-      rconReady = false;
-      rconSocket = null;
-    });
-
-    let tries = 0;
-    const waitReady2 = () => {
-      if (rconReady && rconSocket) return resolve(rconSocket);
-      if (!rconSocket) return reject(new Error("RCON connection failed"));
-      if (tries++ > 40) return reject(new Error("RCON auth timeout"));
-      setTimeout(waitReady2, 50);
-    };
-    waitReady2();
   });
+  p.on("error", () => {});
+}
+if (UPDATE_CHECK_INTERVAL_SEC > 0) {
+  setTimeout(checkForUpdate, 5 * 60 * 1000).unref(); // first check 5 min after boot
+  setInterval(checkForUpdate, UPDATE_CHECK_INTERVAL_SEC * 1000).unref();
 }
 
-function sendLegacyRconOnce(cmdTxt) {
-  if (!RCON_PASS || !cmdTxt.trim()) return Promise.resolve();
-  return ensureLegacyRconConnection().then((socket) => {
-    return new Promise((resolve, reject) => {
-      try {
-        const id = Date.now() & 0x7fffffff;
-        socket.write(pkt(id, SERVERDATA_EXECCOMMAND, cmdTxt));
-        resolve();
-      } catch (e) {
-        reject(e);
-      }
-    });
-  });
+// ---------- panel commands ----------
+function cmdHelp() {
+  wline("[cobalt] commands: !<sh> · .version · .pin [build] · .unpin · .rollback <build|last> · " +
+    ".wipe map · .wipe full confirm · .telemetry · rcon:<x> · quit" + (ALLOW_STDIN ? " · .stdin <x>" : ""));
 }
 
-// --- WebRCON (WebSocket JSON) ---
-let webRconSocket = null;
-let webRconReady = false;
-
-function ensureWebRconConnection() {
-  return new Promise((resolve, reject) => {
-    if (!RCON_PASS) return reject(new Error("RCON_PASS not set"));
-    if (!WebSocket) {
-      return reject(
-        new Error("WebRCON mode requires 'ws' package (npm install ws)"),
-      );
-    }
-
-    if (webRconSocket && webRconReady) return resolve(webRconSocket);
-
-    if (webRconSocket && !webRconReady) {
-      let tries = 0;
-      const waitReady = () => {
-        if (webRconReady && webRconSocket) return resolve(webRconSocket);
-        if (!webRconSocket) return reject(new Error("WebRCON socket lost"));
-        if (tries++ > 40) return reject(new Error("WebRCON connect timeout"));
-        setTimeout(waitReady, 50);
-      };
-      return waitReady();
-    }
-
-    const url = `ws://${RCON_HOST}:${RCON_PORT}/${encodeURIComponent(
-      RCON_PASS,
-    )}`;
-    const ws = new WebSocket(url);
-
-    webRconSocket = ws;
-    webRconReady = false;
-
-    ws.on("open", () => {
-      webRconReady = true;
-      process.stdout.write(
-        `${C.dim}${hhmm()}${C.reset} [rcon] WebRCON connected\n`,
-      );
-      resolve(ws);
-    });
-
-    ws.on("message", (data) => {
-      try {
-        const txt = data.toString("utf8");
-
-        // Rust WebRCON sends JSON: { Identifier, Message, Type, ... }
-        let obj = null;
-        try {
-          obj = JSON.parse(txt);
-        } catch {
-          obj = null;
-        }
-
-        let payload = "";
-
-        if (obj && typeof obj.Message === "string") {
-          payload = obj.Message;
-        } else {
-          // fallback: treat raw text as the body
-          payload = txt;
-        }
-
-        // Clean & split into lines
-        payload = payload.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
-        const lines = payload.split(/\r?\n/);
-
-        for (const ln of lines) {
-          const trimmed = ln.trim();
-          if (!trimmed) continue;
-
-          // Ignore only lines that start with "[oxide]" (to avoid duplicates)
-          if (trimmed.startsWith("[oxide]")) {
-            continue;
-          }
-
-          const out = `${C.dim}${hhmm()}${C.reset} [rcon] ${ln}`;
-          process.stdout.write(`${C.fg.cyan}${out}${C.reset}\n`);
-        }
-      } catch (e) {
-        process.stdout.write(
-          `${C.fg.red}${hhmm()} [rcon] WebRCON message decode error: ${e.message}${C.reset}\n`,
-        );
-      }
-    });
-
-    ws.on("error", (e) => {
-      process.stdout.write(
-        `${C.fg.red}${hhmm()} [rcon] WebRCON error: ${e.message}${C.reset}\n`,
-      );
-      webRconReady = false;
-      webRconSocket = null;
-    });
-
-    ws.on("close", () => {
-      process.stdout.write(
-        `${C.dim}${hhmm()}${C.reset} [rcon] WebRCON closed\n`,
-      );
-      webRconReady = false;
-      webRconSocket = null;
-    });
-
-    let tries = 0;
-    const waitReady2 = () => {
-      if (webRconReady && webRconSocket) return resolve(webRconSocket);
-      if (!webRconSocket) return reject(new Error("WebRCON connection failed"));
-      if (tries++ > 80) return reject(new Error("WebRCON connect timeout"));
-      setTimeout(waitReady2, 50);
-    };
-    waitReady2();
-  });
-}
-
-function sendWebRconOnce(cmdTxt) {
-  if (!RCON_PASS || !cmdTxt.trim()) return Promise.resolve();
-  return ensureWebRconConnection().then((ws) => {
-    return new Promise((resolve, reject) => {
-      try {
-        const id = Date.now() & 0x7fffffff;
-        const payload = {
-          Identifier: id,
-          Message: cmdTxt,
-          Name: "WebRcon",
-        };
-        ws.send(JSON.stringify(payload), (err) => {
-          if (err) return reject(err);
-          resolve();
-        });
-      } catch (e) {
-        reject(e);
-      }
-    });
-  });
-}
-
-// --- unified sendRconOnce (picks legacy vs WebRCON) ---
-function sendRconOnce(cmdTxt) {
-  if (!RCON_PASS || !cmdTxt.trim()) return Promise.resolve();
-
-  if (RCON_MODE === "web") {
-    return sendWebRconOnce(cmdTxt);
+function cmdVersion() {
+  const acf = acfInfo();
+  const pin = readText(PIN_FILE);
+  const li = readJson(LAST_INSTALL) || {};
+  wline(`[version] installed build: ${acf ? acf.buildid : "unknown"} · framework: ${li.framework || "?"} ${li.version || ""}` +
+    (pin ? ` · pinned: ${pin}` : " · not pinned"));
+  if (fs.existsSync(PENDING_ROLLBACK)) wline("[version] rollback staged — restart to apply", C.yellow);
+  if (fs.existsSync(PENDING_WIPE)) wline(`[version] ${readText(PENDING_WIPE)} wipe pending — applies next boot`, C.yellow);
+  const cat = readJson(CATALOG) || [];
+  if (!cat.length) return wline("[version] catalog empty (populates after first update)");
+  wline("[version] catalog (newest first):");
+  for (const e of cat) {
+    const art = e.frameworkArtifact && fs.existsSync(e.frameworkArtifact) ? "archived" : "-";
+    wline(`  ${e.buildid}  ${e.framework} ${e.frameworkVersion}  fw:${art}  ${(e.recorded_at || "").slice(0, 10)}`);
   }
-  // default: legacy
-  return sendLegacyRconOnce(cmdTxt);
 }
 
-// ---------- Rust PID resolver for .stack (via /proc) ----------
-function resolveRustPid() {
+function cmdPin(arg) {
+  const acf = acfInfo();
+  const build = arg ? parseInt(arg, 10) : acf ? acf.buildid : 0;
+  if (!build) return werr("[pin] no buildid (no acf yet?) — usage: .pin [buildid]");
+  fs.writeFileSync(PIN_FILE, String(build));
+  wline(`[pin] pinned to build ${build} — updates skipped until .unpin. ` +
+    "NOTE: clients force-update; a pinned server goes protocol-incompatible within days.", C.yellow);
+}
+
+function cmdUnpin() {
+  fs.rmSync(PIN_FILE, { force: true });
+  wline("[pin] unpinned — next boot resumes updates");
+}
+
+function cmdWipe(rest) {
+  const [type, confirm] = rest.split(/\s+/);
+  if (type === "map") {
+    fs.writeFileSync(PENDING_WIPE, "map");
+    return wline("[wipe] MAP wipe staged — applies at next restart", C.yellow);
+  }
+  if (type === "full") {
+    if (confirm !== "confirm")
+      return werr("[wipe] full wipe deletes blueprints — type: .wipe full confirm");
+    fs.writeFileSync(PENDING_WIPE, "full");
+    return wline("[wipe] FULL wipe (map + blueprints) staged — applies at next restart", C.yellow);
+  }
+  werr("[wipe] usage: .wipe map | .wipe full confirm");
+}
+
+let rollbackActive = false;
+function cmdRollback(arg) {
+  if (rollbackActive) return werr("[rollback] already staging");
+  const cat = readJson(CATALOG) || [];
+  const acf = acfInfo();
+  if (!cat.length) return werr("[rollback] catalog empty — nothing recorded to roll back to");
+  let target = null;
+  if (arg === "last") target = cat.find((e) => !acf || e.buildid !== acf.buildid) || null;
+  else target = cat.find((e) => e.buildid === parseInt(arg, 10)) || null;
+  if (!target) return werr(`[rollback] no catalog entry for '${arg}' — see .version`);
+  if (!target.depots || !target.depots.length) return werr("[rollback] entry has no depot manifests recorded");
+  // disk headroom: download_depot writes a full extra copy
   try {
-    const entries = fs.readdirSync("/proc", { withFileTypes: true });
-    const pids = [];
+    const s = fs.statfsSync(HOME);
+    const freeGB = (s.bavail * s.bsize) / 1024 ** 3;
+    if (freeGB < 10) return werr(`[rollback] need ~10GB free, have ${freeGB.toFixed(1)}GB — aborting`);
+  } catch {}
+  const ageDays = (Date.now() - Date.parse(target.recorded_at || 0)) / 86400000;
+  if (ageDays > 90) wline(`[rollback] entry is ${ageDays.toFixed(0)} days old — Steam may no longer serve its manifests`, C.yellow);
+  const sc = steamcmdCmd();
+  if (!sc) return werr("[rollback] steamcmd not found");
 
-    for (const ent of entries) {
-      if (!ent.isDirectory()) continue;
-      const name = ent.name;
-      if (!/^\d+$/.test(name)) continue;
-
-      const pid = parseInt(name, 10);
-      if (!Number.isFinite(pid) || pid <= 1) continue;
-
-      try {
-        const commPath = `/proc/${pid}/comm`;
-        const comm = fs.readFileSync(commPath, "utf8").trim();
-        if (comm === "RustDedicated") {
-          pids.push(pid);
-        }
-      } catch {
-        // ignore races / permission issues
+  rollbackActive = true;
+  wline(`[rollback] staging build ${target.buildid} (${target.depots.length} depot(s)) — server keeps running`);
+  const depots = [...target.depots];
+  const next = () => {
+    const d = depots.shift();
+    if (!d) {
+      writeJson(PENDING_ROLLBACK, target);
+      fs.writeFileSync(PIN_FILE, String(target.buildid));
+      rollbackActive = false;
+      wline(`[rollback] staged + pinned to ${target.buildid}. RESTART the server to apply.`, C.green);
+      return;
+    }
+    wline(`[rollback] downloading depot ${d.id} manifest ${d.manifest}…`);
+    const p = spawn(sc.cmd, [...sc.pre, "+login", "anonymous", "+download_depot", APPID, d.id, d.manifest, "+quit"],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    const onD = (buf) => {
+      out += buf.toString();
+      for (const ln of buf.toString().split(/\r?\n/))
+        if (ln.trim() && /Depot download complete|error|failed|denied/i.test(ln)) wline(`[rollback] ${ln.trim()}`);
+    };
+    p.stdout.on("data", onD); p.stderr.on("data", onD);
+    p.on("exit", (code) => {
+      if (code !== 0 || !/Depot download complete/i.test(out)) {
+        rollbackActive = false;
+        return werr(`[rollback] depot ${d.id} download FAILED (exit ${code}) — rollback NOT staged. ` +
+          "Old manifests may no longer be served by Steam.");
       }
-    }
-
-    if (pids.length) {
-      pids.sort((a, b) => a - b);
-      return pids[0]; // lowest PID RustDedicated
-    }
-  } catch {
-    // ignore
-  }
-
-  return null;
+      next();
+    });
+    p.on("error", (e) => { rollbackActive = false; werr(`[rollback] steamcmd spawn failed: ${e.message}`); });
+  };
+  next();
 }
 
-// ---------- panel input handler ----------
+// ---------- graceful stop ----------
+let stopping = false;
+function gracefulStop(reason) {
+  if (stopping) return;
+  stopping = true;
+  wline(`[cobalt] stopping (${reason}) — quit via ${wsReady ? "rcon" : "stdin"}, waiting up to ${SHUTDOWN_TIMEOUT_SEC}s for save`);
+  let delivered = false;
+  if (wsReady && ws) {
+    try { ws.send(JSON.stringify({ Identifier: nextId++, Message: "quit", Name: "Cobalt" })); delivered = true; } catch {}
+  }
+  if (!delivered) { try { game.stdin.write("quit\n"); } catch {} }
+  setTimeout(() => {
+    if (game.exitCode === null) {
+      werr(`[cobalt] no exit after ${SHUTDOWN_TIMEOUT_SEC}s — SIGTERM`);
+      try { game.kill("SIGTERM"); } catch {}
+      setTimeout(() => {
+        if (game.exitCode === null) { werr("[cobalt] SIGKILL"); try { game.kill("SIGKILL"); } catch {} }
+      }, 10000).unref();
+    }
+  }, SHUTDOWN_TIMEOUT_SEC * 1000).unref();
+}
+["SIGTERM", "SIGINT"].forEach((sig) => process.on(sig, () => gracefulStop(sig)));
+
+// ---------- panel input router ----------
 process.stdin.setEncoding("utf8");
 let stdinBuf = "";
-
 process.stdin.on("data", (txt) => {
   stdinBuf += txt;
   const lines = stdinBuf.split(/\r?\n/);
   stdinBuf = lines.pop();
-
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
+  for (const raw of lines) {
+    const line = raw.trim();
     if (!line) continue;
 
-    // 1) Shell passthrough
+    if (/^quit$/i.test(line)) { gracefulStop("stop command"); continue; }
+
     if (line.startsWith("!")) {
       const sh = line.slice(1).trim();
-      if (!sh) {
-        process.stdout.write(
-          `${C.fg.yellow}${hhmm()} [shell] (empty)${C.reset}\n`,
-        );
-        continue;
-      }
-      process.stdout.write(
-        `${C.dim}${hhmm()}${C.reset} [shell] ${sh}\n`,
-      );
-      const shProc = spawn("bash", ["-lc", sh], {
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      shProc.stdout.on("data", (d) => process.stdout.write(`${d}`));
-      shProc.stderr.on("data", (d) => process.stderr.write(`${d}`));
-      shProc.on("exit", (code) =>
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [shell] exit ${code}\n`,
-        ),
-      );
+      if (!sh) { werr("[shell] empty"); continue; }
+      wline(`[shell] ${sh}`);
+      const p = spawn("bash", ["-lc", sh], { stdio: ["ignore", "pipe", "pipe"], cwd: HOME });
+      p.stdout.on("data", (d) => process.stdout.write(d));
+      p.stderr.on("data", (d) => process.stderr.write(d));
+      p.on("exit", (code) => wline(`[shell] exit ${code}`));
+      p.on("error", (e) => werr(`[shell] ${e.message}`));
       continue;
     }
 
-    // 2) Runtime default mode toggle
-    if (line.toLowerCase().startsWith(".mode ")) {
-      const m = line.split(/\s+/, 2)[1]?.toLowerCase();
-      if (m === "stdin" || m === "rcon" || m === "auto") {
-        process.env.CONSOLE_MODE = m;
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [mode] default set to ${m}\n`,
-        );
-      } else {
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [mode] use: .mode stdin | rcon | auto\n`,
-        );
-      }
+    const lower = line.toLowerCase();
+    if (lower === ".help") { cmdHelp(); continue; }
+    if (lower === ".version") { cmdVersion(); continue; }
+    if (lower === ".telemetry") { printTelemetry(); continue; }
+    if (lower === ".unpin") { cmdUnpin(); continue; }
+    if (lower === ".pin" || lower.startsWith(".pin ")) { cmdPin(line.slice(4).trim()); continue; }
+    if (lower.startsWith(".rollback")) {
+      const arg = line.slice(9).trim();
+      if (!arg) { werr("[rollback] usage: .rollback <buildid|last>"); continue; }
+      cmdRollback(arg); continue;
+    }
+    if (lower.startsWith(".wipe")) { cmdWipe(line.slice(5).trim().toLowerCase()); continue; }
+    if (lower.startsWith(".stdin ")) {
+      if (!ALLOW_STDIN) { werr("[stdin] disabled — set ALLOW_STDIN=1"); continue; }
+      const payload = line.slice(7);
+      try { game.stdin.write(payload + "\n"); wline(`[stdin] ${payload}`); }
+      catch { werr("[stdin] write failed"); }
       continue;
     }
+    if (lower.startsWith("rcon:")) { rconSend(line.slice(5).trim()); continue; }
+    if (line.startsWith(".")) { werr(`[cobalt] unknown command '${line}' — .help`); continue; }
 
-    // 2a) Telemetry snapshot
-    if (line.toLowerCase() === ".telemetry") {
-      printTelemetry("telemetry");
-      continue;
-    }
-
-    // 2b) Heap details
-    if (line.toLowerCase() === ".heap") {
-      printHeapDetails();
-      continue;
-    }
-
-    // 2c) Stack trace via gdb, targeting RustDedicated
-    if (line.toLowerCase() === ".stack") {
-      const rustPid = resolveRustPid();
-
-      if (!rustPid) {
-        process.stdout.write(
-          `${C.fg.red}${hhmm()} [stack] could not resolve RustDedicated PID (is the server running?)${C.reset}\n`,
-        );
-        continue;
-      }
-
-      process.stdout.write(
-        `${C.dim}${hhmm()}${C.reset} [stack] running gdb backtrace on pid ${rustPid}\n`,
-      );
-
-      const bt = spawn(
-        "gdb",
-        ["-batch", "-ex", "thread apply all bt", "-p", String(rustPid)],
-        {
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
-
-      bt.stdout.on("data", (d) => {
-        const text = d.toString();
-        for (const ln of text.split(/\r?\n/)) {
-          const trimmed = ln.trim();
-          if (!trimmed) continue;
-          process.stdout.write(
-            `${C.dim}${hhmm()}${C.reset} [gdb] ${trimmed}\n`,
-          );
-        }
-      });
-
-      bt.stderr.on("data", (d) => {
-        const text = d.toString();
-        for (const ln of text.split(/\r?\n/)) {
-          const trimmed = ln.trim();
-          if (!trimmed) continue;
-          process.stdout.write(
-            `${C.fg.red}${hhmm()} [gdb] ${trimmed}${C.reset}\n`,
-          );
-        }
-      });
-
-      bt.on("exit", (code) => {
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [stack] gdb exited with code ${code}\n`,
-        );
-      });
-
-      continue;
-    }
-
-    // 3) Explicit routing prefixes
-    let route = (process.env.CONSOLE_MODE || "auto").toLowerCase();
-    let payload = line;
-
-    if (line.toLowerCase().startsWith("stdin:")) {
-      route = "stdin";
-      payload = line.slice(6).trimStart();
-    } else if (line.toLowerCase().startsWith("console:")) {
-      route = "stdin";
-      payload = line.slice(8).trimStart();
-    } else if (line.toLowerCase().startsWith("rcon:")) {
-      route = "rcon";
-      payload = line.slice(5).trimStart();
-    }
-
-    // 4) Resolve "auto" and missing RCON
-    if (route === "auto") route = RCON_PASS ? "rcon" : "stdin";
-    if (route === "rcon" && !RCON_PASS) {
-      process.stdout.write(
-        `${C.dim}${hhmm()}${C.reset} [rcon] disabled (no pass); using stdin\n`,
-      );
-      route = "stdin";
-    }
-
-    // 5) Dispatch
-    if (route === "stdin") {
-      try {
-        game.stdin.write(payload + "\n");
-        process.stdout.write(
-          `${C.dim}${hhmm()}${C.reset} [stdin] ${payload}\n`,
-        );
-      } catch {
-        process.stdout.write(
-          `${C.fg.red}${hhmm()} [stdin] failed to write${C.reset}\n`,
-        );
-      }
-    } else {
-      // route === "rcon"
-      sendRconOnce(payload).catch((e) => {
-        process.stdout.write(
-          `${C.fg.red}${hhmm()} [rcon] ${payload} -> ${e.message}${C.reset}\n`,
-        );
-      });
-    }
+    rconSend(line); // default route
   }
 });
-
 process.stdin.resume();
 
-// ---------- signals ----------
-let exited = false;
-
-["SIGTERM", "SIGINT"].forEach((sig) => {
-  process.on(sig, () => {
-    if (!exited) {
-      const line = `${C.dim}${hhmm()}${C.reset} stopping server...`;
-      process.stdout.write(`${line}\n`);
-      try {
-        game.stdin.write("quit\n");
-      } catch {}
-      setTimeout(() => {
-        try {
-          game.kill("TERM");
-        } catch {}
-      }, 5000);
-    }
-  });
-});
-
-game.on("exit", (code) => {
-  exited = true;
-  if (tailProc && !tailProc.killed) {
-    try {
-      tailProc.kill("TERM");
-    } catch {}
-  }
-
-  // flush any partial buffered line fragments
-  for (const k of Object.keys(buffers)) {
-    const rem = buffers[k];
-    if (!rem) continue;
-    const label = tagForLine(rem);
-    const color =
-      label === "[oxide]"
-        ? C.fg.magenta
-        : label === "[carbon]"
-          ? C.fg.cyan
-          : C.fg.white;
-    const out = `${C.dim}${hhmm()}${C.reset} ${
-      label ? label + " " : ""
-    }${rem}`;
-    process.stdout.write(`${color}${out}${C.reset}\n`);
-    buffers[k] = "";
-  }
-
-  const summary = `${C.dim}${hhmm()}${C.reset} exited with code: ${code}`;
-  process.stdout.write(`${summary}\n`);
-  process.exit(code ?? 0);
+// ---------- game exit ----------
+game.on("error", (e) => { werr(`[cobalt] failed to start game: ${e.message}`); process.exit(1); });
+game.on("exit", (code, signal) => {
+  exiting = true;
+  try { if (ws) ws.close(); } catch {}
+  wline(`[cobalt] server exited with code ${code}${signal ? ` (signal ${signal})` : ""}`);
+  // give tail a beat to flush the last log lines, then stop it and exit
+  setTimeout(() => {
+    try { tailProc.kill("SIGTERM"); } catch {}
+    if (tailBuf.trim()) gline(tailBuf, false);
+    cobaltLog.end();
+    process.exit(code ?? 0);
+  }, 250);
 });

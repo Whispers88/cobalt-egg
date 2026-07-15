@@ -1,0 +1,402 @@
+{
+  "_comment": "Cobalt 2.0 egg — pairs with ghcr.io/whispers88/cobalt-egg:latest (v2 image)",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2026-07-15T00:00:00+00:00",
+  "name": "Cobalt88 v2",
+  "author": "whispers88dev@gmail.com",
+  "description": "Rust Dedicated Server — Cobalt 2.0: version pin/rollback, wipe management, logfile+WebRCON console. Console: .help for commands.",
+  "features": null,
+  "docker_images": {
+    "ghcr.io\/whispers88\/cobalt-egg:latest": "ghcr.io\/whispers88\/cobalt-egg:latest"
+  },
+  "file_denylist": [],
+  "startup": ".\/RustDedicated -batchmode -logfile \/home\/container\/unity.log +server.port {{SERVER_PORT}} +server.queryport {{QUERY_PORT}} +server.identity \\\"{{SERVER_IDENTITY}}\\\" +rcon.port {{RCON_PORT}} +rcon.web true +server.hostname \\\"{{HOSTNAME}}\\\" +server.level \\\"{{LEVEL}}\\\" +server.description \\\"{{DESCRIPTION}}\\\" +server.url \\\"{{SERVER_URL}}\\\" +server.headerimage \\\"{{SERVER_IMG}}\\\" +server.logoimage \\\"{{SERVER_LOGO}}\\\" +server.maxplayers {{MAX_PLAYERS}} +rcon.password \\\"{{RCON_PASS}}\\\" +server.saveinterval {{SAVEINTERVAL}} +app.port {{APP_PORT}} +server.gamemode \\\"{{GAMEMODE}}\\\" +server.tags \\\"{{SERVER_TAGS}}\\\" $( [ -z ${MAP_URL} ] && printf %s \"+server.worldsize \\\"{{WORLD_SIZE}}\\\" +server.seed \\\"{{WORLD_SEED}}\\\"\" || printf %s \"+server.levelurl {{MAP_URL}}\" ) {{ADDITIONAL_ARGS}}",
+  "config": {
+    "files": "{}",
+    "startup": "{\r\n    \"done\": \"Server startup complete\"\r\n}",
+    "logs": "{}",
+    "stop": "quit"
+  },
+  "scripts": {
+    "installation": {
+      "script": null,
+      "container": "alpine:3.4",
+      "entrypoint": "ash"
+    }
+  },
+  "variables": [
+    {
+      "name": "Query Port",
+      "description": "Query port (UDP). Must differ from game port.",
+      "env_variable": "QUERY_PORT",
+      "default_value": "28017",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer",
+      "field_type": "text"
+    },
+    {
+      "name": "RCON Port",
+      "description": "WebRCON port (TCP).",
+      "env_variable": "RCON_PORT",
+      "default_value": "28016",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer",
+      "field_type": "text"
+    },
+    {
+      "name": "App Port",
+      "description": "Rust+ App port (TCP). Use -1 to disable.",
+      "env_variable": "APP_PORT",
+      "default_value": "28082",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer",
+      "field_type": "text"
+    },
+    {
+      "name": "Server Name",
+      "description": "Name shown in server list.",
+      "env_variable": "HOSTNAME",
+      "default_value": "A Rust Server",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:60",
+      "field_type": "text"
+    },
+    {
+      "name": "Description",
+      "description": "Use \\n for new lines.",
+      "env_variable": "DESCRIPTION",
+      "default_value": "Powered by Cobalt",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string",
+      "field_type": "text"
+    },
+    {
+      "name": "URL",
+      "description": "Appears on \"Visit Website\".",
+      "env_variable": "SERVER_URL",
+      "default_value": "https:\/\/pterodactyl.io",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|url",
+      "field_type": "text"
+    },
+    {
+      "name": "Server Image",
+      "description": "Header image URL.",
+      "env_variable": "SERVER_IMG",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|url",
+      "field_type": "text"
+    },
+    {
+      "name": "Server Logo",
+      "description": "Circular logo (Rust+).",
+      "env_variable": "SERVER_LOGO",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|url",
+      "field_type": "text"
+    },
+    {
+      "name": "Level",
+      "description": "World file (e.g., Procedural Map).",
+      "env_variable": "LEVEL",
+      "default_value": "Procedural Map",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:20",
+      "field_type": "text"
+    },
+    {
+      "name": "World Size",
+      "description": "For procedural maps.",
+      "env_variable": "WORLD_SIZE",
+      "default_value": "3000",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer",
+      "field_type": "text"
+    },
+    {
+      "name": "World Seed",
+      "description": "For procedural maps. Overridden after wipes when Wipe New Seed is set.",
+      "env_variable": "WORLD_SEED",
+      "default_value": "1234",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Max Players",
+      "description": "Maximum concurrent players.",
+      "env_variable": "MAX_PLAYERS",
+      "default_value": "40",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer",
+      "field_type": "text"
+    },
+    {
+      "name": "RCON Password",
+      "description": "Set a strong password. The console send-path depends on it.",
+      "env_variable": "RCON_PASS",
+      "default_value": "CHANGEME",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|regex:\/^[\\w.-]*$\/|max:64",
+      "field_type": "text"
+    },
+    {
+      "name": "Save Interval",
+      "description": "Auto-save interval in seconds.",
+      "env_variable": "SAVEINTERVAL",
+      "default_value": "60",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer",
+      "field_type": "text"
+    },
+    {
+      "name": "Custom Map URL",
+      "description": "Direct download URL overrides the map. Invalid URLs crash the server.",
+      "env_variable": "MAP_URL",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|url",
+      "field_type": "text"
+    },
+    {
+      "name": "Server Tags",
+      "description": "Comma-separated tags (e.g. monthly,vanilla,NA). See Facepunch docs.",
+      "env_variable": "SERVER_TAGS",
+      "default_value": "vanilla",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Gamemode",
+      "description": "vanilla, softcore, or hardcore.",
+      "env_variable": "GAMEMODE",
+      "default_value": "vanilla",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Server Identity",
+      "description": "Folder for saves\/logs (server\/<identity>). Wipes target this folder.",
+      "env_variable": "SERVER_IDENTITY",
+      "default_value": "rust",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|regex:\/^[a-z0-9_-]+$\/",
+      "field_type": "text"
+    },
+    {
+      "name": "Rust+ Public IP",
+      "description": "Node public IP if needed (usually auto).",
+      "env_variable": "APP_PUBLIC_IP",
+      "default_value": "",
+      "user_viewable": false,
+      "user_editable": false,
+      "rules": "nullable|string|max:15",
+      "field_type": "text"
+    },
+    {
+      "name": "Modding Framework",
+      "description": "vanilla, oxide, oxide-staging, carbon, carbon-minimal, carbon-edge, carbon-edge-minimal, carbon-staging, carbon-staging-minimal, carbon-aux1, carbon-aux1-minimal, carbon-aux2, carbon-aux2-minimal",
+      "env_variable": "FRAMEWORK",
+      "default_value": "carbon",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:vanilla,oxide,oxide-staging,carbon,carbon-minimal,carbon-edge,carbon-edge-minimal,carbon-staging,carbon-staging-minimal,carbon-aux1,carbon-aux1-minimal,carbon-aux2,carbon-aux2-minimal",
+      "field_type": "text"
+    },
+    {
+      "name": "Auto Update Game",
+      "description": "Run SteamCMD app_update on start (1=yes, 0=no). Ignored while pinned.",
+      "env_variable": "AUTO_UPDATE",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|boolean",
+      "field_type": "text"
+    },
+    {
+      "name": "Framework Update",
+      "description": "Update\/install the selected framework on start (1=yes, 0=no). Ignored while pinned.",
+      "env_variable": "FRAMEWORK_UPDATE",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|boolean",
+      "field_type": "text"
+    },
+    {
+      "name": "Validate Game Files",
+      "description": "Full SteamCMD file validation each start (slow — minutes). Normally 0; runs automatically once after a rollback.",
+      "env_variable": "VALIDATE",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|boolean",
+      "field_type": "text"
+    },
+    {
+      "name": "Pin Build",
+      "description": "Freeze the server on this Steam buildid (empty = not pinned). Console: .pin \/ .unpin \/ .version.",
+      "env_variable": "PIN_BUILD",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|integer",
+      "field_type": "text"
+    },
+    {
+      "name": "Wipe New Seed",
+      "description": "Seed handling after a wipe: keep, random, or a comma-separated rotation list.",
+      "env_variable": "WIPE_NEW_SEED",
+      "default_value": "keep",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Shutdown Timeout (sec)",
+      "description": "How long to wait for the save on quit before force-killing. Big maps need 30-60s.",
+      "env_variable": "SHUTDOWN_TIMEOUT_SEC",
+      "default_value": "60",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:5|max:300",
+      "field_type": "text"
+    },
+    {
+      "name": "Update Check Interval (sec)",
+      "description": "Warn in console when Facepunch ships a new build. 0 = disabled.",
+      "env_variable": "UPDATE_CHECK_INTERVAL_SEC",
+      "default_value": "3600",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:0",
+      "field_type": "text"
+    },
+    {
+      "name": "Telemetry Interval (sec)",
+      "description": "Periodic game CPU\/RSS line in console. 0 = disabled (.telemetry works regardless).",
+      "env_variable": "TELEMETRY_INTERVAL_SEC",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:0",
+      "field_type": "text"
+    },
+    {
+      "name": "Allow Stdin Escape Hatch",
+      "description": "Enable the .stdin command (writes directly to game stdin). Rarely needed.",
+      "env_variable": "ALLOW_STDIN",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|boolean",
+      "field_type": "text"
+    },
+    {
+      "name": "Preserve Dirs",
+      "description": "Comma-separated top-level names a rollback apply must never touch.",
+      "env_variable": "PRESERVE_DIRS",
+      "default_value": "oxide,carbon,cfg,Configs,plugins,Carbon,oxide.config.json,server,.cobalt,steamcmd,Steam,.steam,steamapps",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Min Free Disk (MB)",
+      "description": "Refuse to boot below this much free disk (DISK_ENFORCE=1).",
+      "env_variable": "DISK_MIN_FREE_MB",
+      "default_value": "1024",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:0",
+      "field_type": "text"
+    },
+    {
+      "name": "Enforce Disk Guard",
+      "description": "1 = refuse to boot on low disk, 0 = warn only.",
+      "env_variable": "DISK_ENFORCE",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|boolean",
+      "field_type": "text"
+    },
+    {
+      "name": "Preflight Port Check",
+      "description": "Check RCON\/query\/game ports are free before boot.",
+      "env_variable": "PREFLIGHT_PORTCHECK",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|boolean",
+      "field_type": "text"
+    },
+    {
+      "name": "OOM Watch",
+      "description": "Warn at boot if the previous run was OOM-killed.",
+      "env_variable": "OOM_WATCH",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|boolean",
+      "field_type": "text"
+    },
+    {
+      "name": "Steam Branch",
+      "description": "Optional Steam branch (e.g., staging, aux1). Auto-set by staging\/aux frameworks.",
+      "env_variable": "STEAM_BRANCH",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Steam Branch Password",
+      "description": "Password for private Steam branch (if any).",
+      "env_variable": "STEAM_BRANCH_PASS",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Additional Arguments",
+      "description": "Extra RustDedicated startup flags.",
+      "env_variable": "ADDITIONAL_ARGS",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    }
+  ]
+}
