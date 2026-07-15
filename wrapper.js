@@ -223,7 +223,20 @@ if (bootEntry)
   wline(`[cobalt] build ${bootEntry.buildid} · ${bootEntry.framework} ${bootEntry.frameworkVersion}` +
     (readText(PIN_FILE) ? " · PINNED" : ""), readText(PIN_FILE) ? C.yellow : undefined);
 
-const game = spawn(executable, params, { stdio: ["pipe", "pipe", "pipe"], cwd: HOME, shell: false });
+// Carbon doorstop: the entrypoint hands us the paths as COBALT_ vars; apply the
+// real DOORSTOP_*/LD_PRELOAD names to the GAME child only (never to node itself).
+const childEnv = { ...process.env };
+if (process.env.COBALT_DOORSTOP_TARGET) {
+  childEnv.DOORSTOP_ENABLED = "1";
+  childEnv.DOORSTOP_TARGET_ASSEMBLY = process.env.COBALT_DOORSTOP_TARGET;
+  childEnv.LD_PRELOAD = process.env.COBALT_DOORSTOP_PRELOAD || "";
+  childEnv.LD_LIBRARY_PATH = (process.env.COBALT_DOORSTOP_LDPATH || "") +
+    (process.env.LD_LIBRARY_PATH ? ":" + process.env.LD_LIBRARY_PATH : "");
+  childEnv.TERM = childEnv.TERM || "xterm";
+  wline(`[cobalt] Carbon doorstop active for RustDedicated (${process.env.COBALT_DOORSTOP_PRELOAD})`);
+}
+
+const game = spawn(executable, params, { stdio: ["pipe", "pipe", "pipe"], cwd: HOME, shell: false, env: childEnv });
 
 // native-crash output etc. still arrives on the pipes; show it tagged
 const procBufs = { out: "", err: "" };

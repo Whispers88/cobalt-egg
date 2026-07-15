@@ -519,6 +519,27 @@ fi
 WRAPPER="${COBALT_WRAPPER:-/opt/cobalt/wrapper.js}"
 [[ -f "$WRAPPER" ]] || { bad "wrapper.js not found at ${WRAPPER}"; exit 14; }
 
+# ---------- Carbon doorstop ----------
+# Carbon injects via Unity Doorstop; extracting the tarball is NOT enough — it
+# must be launched with DOORSTOP_*/LD_PRELOAD set (carbon.sh does this). We source
+# Carbon's own env script for the exact paths, pass them to the wrapper as COBALT_
+# vars, and UNSET the real names so only RustDedicated is preloaded, not node.
+case "${FRAMEWORK}" in
+  carbon*)
+    if [[ -f "$CH/carbon/tools/environment.sh" && -f "$CH/libdoorstop.so" ]]; then
+      # shellcheck disable=SC1091
+      source "$CH/carbon/tools/environment.sh"
+      export COBALT_DOORSTOP_TARGET="${DOORSTOP_TARGET_ASSEMBLY:-$CH/carbon/managed/Carbon.Preloader.dll}"
+      export COBALT_DOORSTOP_PRELOAD="${LD_PRELOAD:-$CH/libdoorstop.so}"
+      export COBALT_DOORSTOP_LDPATH="${LD_LIBRARY_PATH:-$CH:$CH/RustDedicated_Data/Plugins/x86_64}"
+      unset DOORSTOP_ENABLED DOORSTOP_TARGET_ASSEMBLY LD_PRELOAD LD_LIBRARY_PATH
+      good "Carbon doorstop environment armed (Carbon will inject into RustDedicated)."
+    else
+      warn "FRAMEWORK=${FRAMEWORK} but Carbon is not installed (carbon/tools/environment.sh or libdoorstop.so missing) — it will NOT load. Set FRAMEWORK_UPDATE=1 and restart."
+    fi
+    ;;
+esac
+
 # ---------- launch (node streams stdout unbuffered; no stdbuf needed) ----------
 log "Launching via Cobalt wrapper 2.0"
 exec "$NODE_BIN" "$WRAPPER" --argv "${ARGV[@]}"

@@ -246,6 +246,25 @@ async function test6_reconnectAfterDelay() {
   await r.waitExit();
 }
 
+async function test7_carbonDoorstop() {
+  console.log("test 7: Carbon doorstop env injected into the game child only");
+  const home = mkHome();
+  writeAcf(home, 11111);
+  const r = new Run(home, { envExtra: {
+    COBALT_DOORSTOP_TARGET: "/x/carbon/managed/Carbon.Preloader.dll",
+    COBALT_DOORSTOP_PRELOAD: "/x/libdoorstop.so",
+    COBALT_DOORSTOP_LDPATH: "/x:/x/RustDedicated_Data/Plugins/x86_64",
+  } });
+  await r.waitFor(/DOORSTOP_ENABLED=1/);
+  ok("game child sees DOORSTOP_ENABLED=1");
+  assert(r.out.includes("LD_PRELOAD=/x/libdoorstop.so"), "child missing LD_PRELOAD");
+  ok("game child sees LD_PRELOAD=libdoorstop.so");
+  assert(r.out.includes("TARGET=/x/carbon/managed/Carbon.Preloader.dll"), "child missing DOORSTOP_TARGET_ASSEMBLY");
+  ok("game child sees DOORSTOP_TARGET_ASSEMBLY");
+  r.send("quit");
+  await r.waitExit();
+}
+
 (async () => {
   await test1_happyPath();
   await test2_stdinFallback();
@@ -253,5 +272,6 @@ async function test6_reconnectAfterDelay() {
   await test4_rollbackStaging();
   await test5_colours();
   await test6_reconnectAfterDelay();
+  await test7_carbonDoorstop();
   console.log(`\nE2E: all ${passed} checks passed`);
 })().catch((e) => { console.error("\nE2E FAILED:", e.message); process.exit(1); });

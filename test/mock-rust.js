@@ -96,6 +96,7 @@ const server = net.createServer((sock) => {
 // delay so tests can exercise "wrapper starts before RCON is listening"
 const RCON_DELAY = parseInt(argAfter("--rcon-delay") || "0", 10);
 wl("Bootstrapping ...");
+wl(`ENV DOORSTOP_ENABLED=${process.env.DOORSTOP_ENABLED || ""} LD_PRELOAD=${process.env.LD_PRELOAD || ""} TARGET=${process.env.DOORSTOP_TARGET_ASSEMBLY || ""}`);
 setTimeout(() => wl("[Oxide] Loading extension Oxide.Rust"), 100);
 setTimeout(() => wl("Server startup complete"), 300);
 let _n = 0;

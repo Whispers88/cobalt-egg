@@ -232,6 +232,31 @@ printf 'map' > "$H/.cobalt/pending_wipe"; run_ep WIPE_MAP_URL=""
 check "empty clears map override"     '[[ ! -f "$H/.cobalt/mapurl" ]]'
 check "reverts to procedural"         'echo "$OUT" | grep -q "+server.worldsize"'
 
+echo "Scenario N: Carbon doorstop armed only when carbon installed"
+new_home
+mkdir -p "$H/carbon/tools" "$H/carbon/managed"
+touch "$H/libdoorstop.so" "$H/carbon/managed/Carbon.Preloader.dll"
+cat > "$H/carbon/tools/environment.sh" <<EOF
+export DOORSTOP_ENABLED=1
+export DOORSTOP_TARGET_ASSEMBLY="$H/carbon/managed/Carbon.Preloader.dll"
+export LD_PRELOAD="$H/libdoorstop.so"
+export LD_LIBRARY_PATH="$H:$H/RustDedicated_Data/Plugins/x86_64"
+EOF
+run_ep FRAMEWORK=carbon-staging
+check "doorstop armed for carbon"       'echo "$OUT" | grep -q "STUB_DOORSTOP.*Carbon.Preloader.dll"'
+check "arming logged"                   'echo "$OUT" | grep -q "doorstop environment armed"'
+# real DOORSTOP/LD_PRELOAD must NOT leak into the exec env (node stays clean)
+check "no raw LD_PRELOAD in exec env"   '! echo "$OUT" | grep -q "STUB_DOORSTOP none.*LD_PRELOAD"'
+# carbon selected but not installed -> warn, do not arm
+new_home
+run_ep FRAMEWORK=carbon-staging
+check "warns when carbon missing"       'echo "$OUT" | grep -q "will NOT load"'
+check "doorstop not armed if missing"   'echo "$OUT" | grep -q "STUB_DOORSTOP none"'
+# vanilla never arms
+new_home
+run_ep FRAMEWORK=vanilla
+check "vanilla does not arm doorstop"   'echo "$OUT" | grep -q "STUB_DOORSTOP none"'
+
 echo ""
 echo "Entrypoint tests: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
