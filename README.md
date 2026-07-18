@@ -3,7 +3,7 @@
 Rust Dedicated Server image + egg for Pterodactyl.
 Image: `ghcr.io/whispers88/cobalt-egg:latest` · Egg: `egg-cobalt88-v2.json`
 
-**2.0:** version pin/rollback via Steam manifests · wipe management ·
+**2.0:** version pin/rollback via Steam manifests · framework/branch decoupled ·
 logfile-read + WebRCON-send console (the PTY/stdin machinery is gone) ·
 zero-dependency wrapper (Node 22 native WebSocket).
 
@@ -18,13 +18,11 @@ zero-dependency wrapper (Node 22 native WebSocket).
 | `.pin [buildid]` | freeze updates on current (or given) build |
 | `.unpin` | resume updates at next restart |
 | `.rollback <buildid\|last>` | download old build now, **applied at next restart** |
-| `.wipe map` | stage map wipe (applies at next restart) |
-| `.wipe full confirm` | stage map+blueprint wipe (token required) |
 | `.telemetry` | game CPU/RSS, loadavg, disk |
 | `.stdin <x>` | write to game stdin (needs `ALLOW_STDIN=1`) |
 
-Destructive operations are **staged as flags and applied at boot** — the only
-safe mutation point in the container lifecycle. `.rollback`/`.wipe` then restart.
+Rollback is **staged as a flag and applied at boot** — the only safe mutation
+point in the container lifecycle; `.rollback` then restart.
 
 ## Version pin & rollback
 
@@ -42,29 +40,37 @@ safe mutation point in the container lifecycle. `.rollback`/`.wipe` then restart
 - An hourly watcher warns in console when Facepunch ships a new build
   (`UPDATE_CHECK_INTERVAL_SEC`, 0 to disable).
 
-## Scheduled wipes (no cron in the egg — use Pterodactyl Schedules)
+## Framework and branch are independent
 
-Create a Schedule (e.g. first Thursday, 19:00):
-1. Task 1 — **Send command**: `.wipe map` (or `.wipe full confirm`)
-2. Task 2 — **Send power action**: Restart (small delay after task 1)
+`FRAMEWORK` (which mod loader) and `STEAM_BRANCH` (which Rust game branch) are
+separate. The framework channel follows the branch:
 
-The boot consumes the flag, wipes `server/<identity>/`, and (if `WIPE_NEW_SEED`
-is `random` or a `csv,rotation,list`) swaps the seed.
+| `STEAM_BRANCH` | Rust game | Carbon tag | Oxide |
+|---|---|---|---|
+| *(empty)* | public | `production_build` | release |
+| `staging` | `-beta staging` | `rustbeta_staging_build` | staging |
+| `aux01` | `-beta aux01` | `rustbeta_aux01_build` | release |
+| `aux02` | `-beta aux02` | `rustbeta_aux02_build` | release |
+
+So `FRAMEWORK=carbon` + `STEAM_BRANCH=staging` = Carbon on the Rust staging
+branch. `FRAMEWORK=vanilla` + `STEAM_BRANCH=staging` = plain staging server.
+For anything the branch mapping doesn't cover (e.g. Carbon edge), set
+`CUSTOM_FRAMEWORK_URL` to a direct `.zip`/`.tar.gz` (it overrides `FRAMEWORK`;
+keep `FRAMEWORK=carbon` so doorstop is still armed).
 
 ## Key variables
 
 | Var | Default | Notes |
 |---|---|---|
-| `FRAMEWORK` | `carbon` | vanilla, oxide[-staging], carbon[-edge/-staging/-aux1/-aux2][-minimal] |
+| `FRAMEWORK` | `carbon` | `vanilla` / `oxide` / `carbon` / `carbon-minimal` |
+| `STEAM_BRANCH` | *(empty)* | Rust game branch: empty=public, `staging`, `aux01`, `aux02` |
+| `CUSTOM_FRAMEWORK_URL` | — | direct framework archive URL; overrides `FRAMEWORK` |
 | `AUTO_UPDATE` | `1` | SteamCMD app_update on boot (ignored while pinned) |
 | `VALIDATE` | `0` | full checksum costs minutes; auto-forced once after rollback |
-| `PIN_BUILD` | — | seed a pin from the panel |
-| `WIPE_NEW_SEED` | `keep` | `random` or `seed,list,rotation` |
-| `WIPE_MAP_URL` | — | custom map on wipe: single URL or `url1,url2` rotated per wipe; empty = keep configured map |
 | `GAMEMODE` | `vanilla` | `vanilla`/`softcore`/`hardcore` (`in:` rule — dropdown on Pelican or with the dropdown addon, validated text box on stock Ptero) |
 | `SHUTDOWN_TIMEOUT_SEC` | `60` | save time before force-kill; big maps need it |
 | `UPDATE_CHECK_INTERVAL_SEC` | `3600` | update-available warning; 0 = off |
-| `SERVER_IDENTITY` | `rust` | wipes target `server/<identity>/` |
+| `SERVER_IDENTITY` | `rust` | saves live in `server/<identity>/` |
 | `DISK_MIN_FREE_MB` / `DISK_ENFORCE` / `PREFLIGHT_PORTCHECK` / `OOM_WATCH` | | boot preflight guards |
 
 A `.pteroignore` is written on first boot so panel backups skip `steamcmd/`,
@@ -78,8 +84,8 @@ bash test/run-tests.sh
 
 No Docker needed: `test/mock-rust.js` fakes RustDedicated (writes the -logfile,
 serves real RFC6455 WebRCON, broadcasts noise the wrapper must suppress) and
-`test/fake-steamcmd.js` fakes depot downloads. 56 checks across wrapper e2e +
-entrypoint wipe/rollback/pin/argv scenarios.
+`test/fake-steamcmd.js` fakes depot downloads. 64 checks across wrapper e2e +
+entrypoint rollback/pin/branch/doorstop/argv scenarios.
 
 ## Still needs verification on a real Linux box
 
@@ -87,4 +93,5 @@ entrypoint wipe/rollback/pin/argv scenarios.
   still download anonymously (manifest request codes).
 - Real Rust WebRCON handshake vs the native Node client (mock is RFC-faithful,
   Rust is the authority).
-- Exact wipe filenames on the current build (`player.*.db` schema suffix).
+- Exact Rust Steam beta branch names (`staging` / `aux01` / `aux02`) as Facepunch
+  currently publishes them, for the `-beta` flag.

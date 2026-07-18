@@ -109,19 +109,6 @@ async function test1_happyPath() {
   assert(!r.out.includes("SPAMLINE"), "unsolicited broadcast leaked to console");
   ok("unsolicited broadcasts suppressed (no dup stream)");
 
-  r.send(".wipe full");
-  await r.waitFor(/\.wipe full confirm/);
-  assert(!fs.existsSync(path.join(home, ".cobalt", "pending_wipe")));
-  ok(".wipe full without confirm refused");
-  r.send(".wipe full confirm");
-  await r.waitFor(/FULL wipe .* staged/);
-  assert.equal(fs.readFileSync(path.join(home, ".cobalt", "pending_wipe"), "utf8"), "full");
-  ok(".wipe full confirm stages flag");
-  r.send(".wipe map");
-  await r.waitFor(/MAP wipe staged/);
-  assert.equal(fs.readFileSync(path.join(home, ".cobalt", "pending_wipe"), "utf8"), "map");
-  ok(".wipe map stages flag");
-
   r.send(".pin");
   await r.waitFor(/pinned to build 11111/);
   assert.equal(fs.readFileSync(path.join(home, ".cobalt", "pin"), "utf8"), "11111");
@@ -133,8 +120,7 @@ async function test1_happyPath() {
 
   r.send(".version");
   await r.waitFor(/installed build: 11111 .* carbon v1\.2\.3/);
-  await r.waitFor(/wipe pending/);
-  ok(".version shows build/framework/pending state");
+  ok(".version shows build/framework/pin state");
 
   r.send(".rollback 424242");
   await r.waitFor(/no catalog entry for '424242'/);

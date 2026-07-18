@@ -20,8 +20,6 @@
 //   .pin [buildid]          freeze updates on current (or given) build
 //   .unpin                  resume updates on next boot
 //   .rollback <build|last>  stage rollback (download now, applied at next boot)
-//   .wipe map               pending map wipe (next boot)
-//   .wipe full confirm      pending full/BP wipe (token required)
 //   .telemetry              game CPU/RSS + loadavg + disk
 //   .stdin <x>              write to game stdin (ALLOW_STDIN=1 only)
 //   rcon: <x>               explicit rcon send
@@ -52,7 +50,6 @@ const ALLOW_STDIN = process.env.ALLOW_STDIN === "1";
 
 const CATALOG = path.join(COBALT_DIR, "versions.json");
 const PIN_FILE = path.join(COBALT_DIR, "pin");
-const PENDING_WIPE = path.join(COBALT_DIR, "pending_wipe");
 const PENDING_ROLLBACK = path.join(COBALT_DIR, "pending_rollback");
 const LAST_INSTALL = path.join(COBALT_DIR, "last_install");
 const FRAMEWORKS_DIR = path.join(COBALT_DIR, "frameworks");
@@ -389,7 +386,7 @@ if (UPDATE_CHECK_INTERVAL_SEC > 0) {
 // ---------- panel commands ----------
 function cmdHelp() {
   wline("[cobalt] commands: !<sh> · .version · .pin [build] · .unpin · .rollback <build|last> · " +
-    ".wipe map · .wipe full confirm · .telemetry · rcon:<x> · quit" + (ALLOW_STDIN ? " · .stdin <x>" : ""));
+    ".telemetry · rcon:<x> · quit" + (ALLOW_STDIN ? " · .stdin <x>" : ""));
 }
 
 function cmdVersion() {
@@ -399,7 +396,6 @@ function cmdVersion() {
   wline(`[version] installed build: ${acf ? acf.buildid : "unknown"} · framework: ${li.framework || "?"} ${li.version || ""}` +
     (pin ? ` · pinned: ${pin}` : " · not pinned"));
   if (fs.existsSync(PENDING_ROLLBACK)) wline("[version] rollback staged — restart to apply", C.yellow);
-  if (fs.existsSync(PENDING_WIPE)) wline(`[version] ${readText(PENDING_WIPE)} wipe pending — applies next boot`, C.yellow);
   const cat = readJson(CATALOG) || [];
   if (!cat.length) return wline("[version] catalog empty (populates after first update)");
   wline("[version] catalog (newest first):");
@@ -421,21 +417,6 @@ function cmdPin(arg) {
 function cmdUnpin() {
   fs.rmSync(PIN_FILE, { force: true });
   wline("[pin] unpinned — next boot resumes updates");
-}
-
-function cmdWipe(rest) {
-  const [type, confirm] = rest.split(/\s+/);
-  if (type === "map") {
-    fs.writeFileSync(PENDING_WIPE, "map");
-    return wline("[wipe] MAP wipe staged — applies at next restart", C.yellow);
-  }
-  if (type === "full") {
-    if (confirm !== "confirm")
-      return werr("[wipe] full wipe deletes blueprints — type: .wipe full confirm");
-    fs.writeFileSync(PENDING_WIPE, "full");
-    return wline("[wipe] FULL wipe (map + blueprints) staged — applies at next restart", C.yellow);
-  }
-  werr("[wipe] usage: .wipe map | .wipe full confirm");
 }
 
 let rollbackActive = false;
@@ -554,7 +535,6 @@ process.stdin.on("data", (txt) => {
       if (!arg) { werr("[rollback] usage: .rollback <buildid|last>"); continue; }
       cmdRollback(arg); continue;
     }
-    if (lower.startsWith(".wipe")) { cmdWipe(line.slice(5).trim().toLowerCase()); continue; }
     if (lower.startsWith(".stdin ")) {
       if (!ALLOW_STDIN) { werr("[stdin] disabled — set ALLOW_STDIN=1"); continue; }
       const payload = line.slice(7);

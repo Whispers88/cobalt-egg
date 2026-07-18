@@ -2,13 +2,14 @@
 set -euo pipefail
 # ============================================================================
 # Cobalt entrypoint 2.0
-#   preflight -> apply pending rollback -> apply pending wipe -> resolve
-#   version (pin skips SteamCMD entirely) -> install framework (+ archive
-#   artifact) -> build argv -> exec wrapper.
+#   preflight -> apply pending rollback -> resolve version (pin skips SteamCMD
+#   entirely) -> install framework (+ archive artifact) -> arm Carbon doorstop
+#   -> build argv -> exec wrapper.
 #
-# All destructive operations (rollback, wipe) are STAGED by the wrapper as
-# flag files in .cobalt/ and applied here, at boot — the only safe mutation
-# point in the container lifecycle.
+# FRAMEWORK (vanilla|oxide|carbon[-minimal]) and STEAM_BRANCH (the Rust game
+# branch) are independent; the framework channel is derived from the branch.
+# Rollback is STAGED by the wrapper as a flag file in .cobalt/ and applied here
+# at boot — the only safe mutation point in the container lifecycle.
 # ============================================================================
 
 RED='\e[31m'; YEL='\e[33m'; GRN='\e[32m'; NC='\e[0m'
@@ -37,17 +38,6 @@ command -v "$NODE_BIN" >/dev/null 2>&1 || NODE_BIN="$(command -v node || true)"
 [[ -n "$NODE_BIN" ]] || { bad "node binary not found"; exit 15; }
 jget() { # jget <file> <accessor>  — path via argv so it survives any platform
   "$NODE_BIN" -e "const o=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));console.log(new Function('o','return o'+process.argv[2])(o))" "$1" "$2"
-}
-
-rotate_csv() { # <csv> <idx-file> -> print next item (trimmed), advance idx. Single item = constant.
-  local csv="$1" idxf="$2" idx=-1
-  IFS=',' read -ra _ITEMS <<< "$csv"
-  [[ -f "$idxf" ]] && idx="$(cat "$idxf" 2>/dev/null || echo -1)"
-  idx=$(( (idx + 1) % ${#_ITEMS[@]} ))
-  printf '%s' "$idx" > "$idxf"
-  local it="${_ITEMS[$idx]}"
-  it="${it#"${it%%[![:space:]]*}"}"; it="${it%"${it##*[![:space:]]}"}"  # trim spaces
-  printf '%s' "$it"
 }
 
 # ---------- .pteroignore (shrink panel backups by GB) ----------
@@ -79,27 +69,19 @@ STEAM_USER="${STEAM_USER:-anonymous}"
 STEAM_PASS="${STEAM_PASS:-}"
 STEAM_AUTH="${STEAM_AUTH:-}"
 
+# FRAMEWORK (vanilla|oxide|carbon|carbon-minimal) and STEAM_BRANCH (the Rust game
+# branch) are now INDEPENDENT — the framework channel derives from the branch.
 FRAMEWORK="${FRAMEWORK:-vanilla}"
 FRAMEWORK_UPDATE="${FRAMEWORK_UPDATE:-1}"
 AUTO_UPDATE="${AUTO_UPDATE:-1}"
 VALIDATE="${VALIDATE:-0}"          # full 8GB checksum every boot costs minutes; app_update alone no-ops when current
 EXTRA_FLAGS="${EXTRA_FLAGS:-}"
-STEAM_BRANCH="${STEAM_BRANCH:-}"
+STEAM_BRANCH="${STEAM_BRANCH:-}"   # "" (public) | staging | aux01 | aux02 | ...
 STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"
 CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 
 SERVER_IDENTITY="${SERVER_IDENTITY:-rust}"
 PRESERVE_DIRS="${PRESERVE_DIRS:-oxide,carbon,cfg,Configs,plugins,Carbon,oxide.config.json,server,.cobalt,steamcmd,Steam,.steam,steamapps}"
-WIPE_NEW_SEED="${WIPE_NEW_SEED:-keep}"
-WIPE_MAP_URL="${WIPE_MAP_URL:-}"
-
-DEFAULT_STEAM_BRANCH=""
-case "${FRAMEWORK}" in
-  vanilla-staging|oxide-staging|carbon-staging* ) DEFAULT_STEAM_BRANCH="staging" ;;
-  vanilla-aux1|carbon-aux1* )                     DEFAULT_STEAM_BRANCH="aux1" ;;
-  vanilla-aux2|carbon-aux2* )                     DEFAULT_STEAM_BRANCH="aux2" ;;
-  * )                                             DEFAULT_STEAM_BRANCH="" ;;
-esac
 
 # RCON + wrapper knobs (wrapper reads env)
 export RCON_HOST="${RCON_HOST:-127.0.0.1}"
@@ -272,47 +254,6 @@ if [[ -f "$PENDING_RB" ]]; then
 fi
 
 # ============================================================================
-# pending WIPE (staged by wrapper: .wipe map | .wipe full confirm)
-# ============================================================================
-PW="$COBALT_DIR/pending_wipe"
-if [[ -f "$PW" ]]; then
-  WTYPE="$(cat "$PW")"
-  IDDIR="$CH/server/${SERVER_IDENTITY}"
-  log "Applying pending ${WTYPE} wipe on server/${SERVER_IDENTITY}"
-  if [[ -d "$IDDIR" ]]; then
-    rm -f "$IDDIR"/*.map "$IDDIR"/*.sav* 2>/dev/null || true
-    if [[ "$WTYPE" == "full" ]]; then
-      rm -f "$IDDIR"/player.blueprints.*.db* \
-            "$IDDIR"/player.deaths.*.db* \
-            "$IDDIR"/player.identities.*.db* \
-            "$IDDIR"/player.states.*.db* \
-            "$IDDIR"/player.tokens.*.db* 2>/dev/null || true
-    fi
-    good "Wiped (${WTYPE})."
-  else
-    warn "wipe: ${IDDIR} does not exist — nothing to wipe."
-  fi
-  # seed rotation
-  if [[ "$WIPE_NEW_SEED" == "random" ]]; then
-    printf '%s' "$(( (RANDOM<<16) ^ (RANDOM<<1) ^ $$ ))" > "$COBALT_DIR/seed"
-    log "wipe: new random seed $(cat "$COBALT_DIR/seed")"
-  elif [[ "$WIPE_NEW_SEED" != "keep" && -n "$WIPE_NEW_SEED" ]]; then
-    rotate_csv "$WIPE_NEW_SEED" "$COBALT_DIR/seed_idx" > "$COBALT_DIR/seed"
-    log "wipe: rotated seed -> $(cat "$COBALT_DIR/seed")"
-  else
-    rm -f "$COBALT_DIR/seed" "$COBALT_DIR/seed_idx"   # keep -> revert to panel WORLD_SEED
-  fi
-  # custom map URL: single string, or comma list rotated each wipe; empty = leave map as configured
-  if [[ -n "$WIPE_MAP_URL" ]]; then
-    rotate_csv "$WIPE_MAP_URL" "$COBALT_DIR/mapurl_idx" > "$COBALT_DIR/mapurl"
-    log "wipe: map URL -> $(cat "$COBALT_DIR/mapurl")"
-  else
-    rm -f "$COBALT_DIR/mapurl" "$COBALT_DIR/mapurl_idx"
-  fi
-  rm -f "$PW"
-fi
-
-# ============================================================================
 # version resolve: pin skips SteamCMD entirely; else app_update
 # ============================================================================
 PIN_FILE="$COBALT_DIR/pin"
@@ -322,25 +263,18 @@ acf_buildid() {
   sed -n 's/.*"buildid"[[:space:]]*"\([0-9]*\)".*/\1/p' "$ACF" | head -1
 }
 
-# seed pin file from PIN_BUILD env on first boot with it set
-if [[ ! -f "$PIN_FILE" && -n "${PIN_BUILD:-}" ]]; then
-  printf '%s' "$PIN_BUILD" > "$PIN_FILE"
-  log "Pin seeded from PIN_BUILD=${PIN_BUILD}"
-fi
-
 do_update() {
   local SCMD; SCMD="$(steamcmd_path)"
   [[ -z "$SCMD" ]] && { bad "steamcmd not found"; exit 11; }
-  local RESOLVED_BRANCH="${STEAM_BRANCH:-${DEFAULT_STEAM_BRANCH}}"
   local BRANCH_FLAGS=""
-  [[ -n "$RESOLVED_BRANCH" ]] && BRANCH_FLAGS="-beta ${RESOLVED_BRANCH}"
+  [[ -n "$STEAM_BRANCH" ]] && BRANCH_FLAGS="-beta ${STEAM_BRANCH}"
   [[ -n "$STEAM_BRANCH_PASS" ]] && BRANCH_FLAGS="${BRANCH_FLAGS} -betapassword ${STEAM_BRANCH_PASS}"
   local VFLAG=""
   if [[ "$VALIDATE" == "1" || -f "$COBALT_DIR/force_validate" ]]; then
     VFLAG="validate"
     [[ -f "$COBALT_DIR/force_validate" ]] && warn "force_validate set (post-rollback) — running full validation."
   fi
-  log "SteamCMD app_update ${SRCDS_APPID} (branch: ${RESOLVED_BRANCH:-default}${VFLAG:+, validate})…"
+  log "SteamCMD app_update ${SRCDS_APPID} (branch: ${STEAM_BRANCH:-public}${VFLAG:+, validate})…"
   "$SCMD" +force_install_dir "$CH" +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
     +app_update "${SRCDS_APPID}" ${BRANCH_FLAGS} ${EXTRA_FLAGS} ${VFLAG} +quit
   rm -f "$COBALT_DIR/force_validate"
@@ -372,9 +306,7 @@ write_last_install() { # framework version artifact
 
 install_oxide() {
   local channel="release" url="" ver="" tag=""
-  case "${FRAMEWORK}" in
-    oxide-staging|uMod-staging|oxide_staging) channel="staging" ;;
-  esac
+  [[ "$STEAM_BRANCH" == "staging" ]] && channel="staging"   # channel follows the game branch
   if [[ "$channel" == "release" ]]; then
     # GitHub tagged releases give a stable, versioned, historically-fetchable URL
     tag="$(curl -fsSL --retry 3 https://api.github.com/repos/OxideMod/Oxide.Rust/releases/latest 2>/dev/null \
@@ -403,29 +335,28 @@ install_oxide() {
 }
 
 # Carbon uses ROLLING tags on CarbonCommunity/Carbon (NOT /releases/latest/ —
-# that only ever resolves to production_build, the sole non-prerelease). The
-# per-channel tag + which Linux asset it actually ships:
+# that only ever resolves to production_build, the sole non-prerelease). The tag
+# follows the Steam BRANCH now, not the framework name:
 carbon_tag() {
-  case "$1" in
-    carbon-edge* )    echo "edge_build" ;;
-    carbon-staging* ) echo "rustbeta_staging_build" ;;
-    carbon-aux1* )    echo "rustbeta_aux01_build" ;;
-    carbon-aux2* )    echo "rustbeta_aux02_build" ;;
-    * )               echo "production_build" ;;
+  case "$STEAM_BRANCH" in
+    staging )       echo "rustbeta_staging_build" ;;
+    aux01|aux1 )    echo "rustbeta_aux01_build" ;;
+    aux02|aux2 )    echo "rustbeta_aux02_build" ;;
+    * )             echo "production_build" ;;   # public / unknown -> production
   esac
 }
-# Ordered asset candidates. Beta tags (edge/staging) ship only Debug, stable
-# tags ship Release — so try Release then fall back to Debug and one wins.
+# Ordered asset candidates. Beta tags (staging/aux) ship only Debug, stable tags
+# ship Release — try Release then fall back to Debug. `-minimal` is orthogonal.
 carbon_assets() {
-  if [[ "$1" == *"-minimal" ]]; then echo "Carbon.Linux.Minimal.tar.gz"
+  if [[ "$FRAMEWORK" == *"-minimal" ]]; then echo "Carbon.Linux.Minimal.tar.gz"
   else echo "Carbon.Linux.Release.tar.gz Carbon.Linux.Debug.tar.gz"; fi
 }
 
 install_carbon() {
-  local tag; tag="$(carbon_tag "$FRAMEWORK")"
+  local tag; tag="$(carbon_tag)"
   local base="${CARBON_BASE:-https://github.com/CarbonCommunity/Carbon/releases/download}/${tag}"
   local tmp; tmp="$(mktemp -d)" got=""
-  for asset in $(carbon_assets "$FRAMEWORK"); do
+  for asset in $(carbon_assets); do
     log "Fetching Carbon ${tag}/${asset}…"
     if curl -fSL --retry 3 -o "$tmp/carbon.tar.gz" "${base}/${asset}"; then got="$asset"; break; fi
     warn "  ${asset} not available for ${tag}; trying next…"
@@ -494,11 +425,6 @@ fi
 # ============================================================================
 # build argv
 # ============================================================================
-# Wipe rotations override via env BEFORE expansion, so the STARTUP conditional
-# naturally swaps procedural<->levelurl and substitutes the rotated seed.
-if [[ -f "$COBALT_DIR/seed" ]];   then export WORLD_SEED="$(cat "$COBALT_DIR/seed")";   log "Seed override (wipe): ${WORLD_SEED}"; fi
-if [[ -f "$COBALT_DIR/mapurl" ]]; then export MAP_URL="$(cat "$COBALT_DIR/mapurl")";     log "Map URL override (wipe): ${MAP_URL}"; fi
-
 if [[ "$#" -gt 0 ]]; then
   ARGV=( "$@" )
 else

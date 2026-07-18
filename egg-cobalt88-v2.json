@@ -221,12 +221,32 @@
     },
     {
       "name": "Modding Framework",
-      "description": "vanilla, oxide, oxide-staging, carbon, carbon-minimal, carbon-edge, carbon-edge-minimal, carbon-staging, carbon-staging-minimal, carbon-aux1, carbon-aux1-minimal, carbon-aux2, carbon-aux2-minimal",
+      "description": "Which mod loader: vanilla, oxide, carbon, or carbon-minimal. The game branch is set separately (Steam Branch) and the framework channel follows it.",
       "env_variable": "FRAMEWORK",
       "default_value": "carbon",
       "user_viewable": true,
       "user_editable": true,
-      "rules": "required|in:vanilla,oxide,oxide-staging,carbon,carbon-minimal,carbon-edge,carbon-edge-minimal,carbon-staging,carbon-staging-minimal,carbon-aux1,carbon-aux1-minimal,carbon-aux2,carbon-aux2-minimal",
+      "rules": "required|in:vanilla,oxide,carbon,carbon-minimal",
+      "field_type": "text"
+    },
+    {
+      "name": "Steam Branch",
+      "description": "Rust game branch, independent of framework. Empty = public (stable). Common betas: staging, aux01, aux02. Carbon\/Oxide auto-match this branch.",
+      "env_variable": "STEAM_BRANCH",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Custom Framework URL",
+      "description": "Direct URL to a framework archive (.zip\/.tar.gz) — overrides Modding Framework when set. For a Carbon build, also set Modding Framework to carbon so doorstop is armed.",
+      "env_variable": "CUSTOM_FRAMEWORK_URL",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|url",
       "field_type": "text"
     },
     {
@@ -257,36 +277,6 @@
       "user_viewable": true,
       "user_editable": true,
       "rules": "required|boolean",
-      "field_type": "text"
-    },
-    {
-      "name": "Pin Build",
-      "description": "Freeze the server on this Steam buildid (empty = not pinned). Console: .pin \/ .unpin \/ .version.",
-      "env_variable": "PIN_BUILD",
-      "default_value": "",
-      "user_viewable": true,
-      "user_editable": true,
-      "rules": "nullable|integer",
-      "field_type": "text"
-    },
-    {
-      "name": "Wipe New Seed",
-      "description": "Seed handling after a wipe: keep, random, or a comma-separated rotation list.",
-      "env_variable": "WIPE_NEW_SEED",
-      "default_value": "keep",
-      "user_viewable": true,
-      "user_editable": true,
-      "rules": "nullable|string",
-      "field_type": "text"
-    },
-    {
-      "name": "Wipe Map URL(s)",
-      "description": "Custom map applied on wipe. A single URL, or a comma-separated list rotated one per wipe. Empty = keep the configured map (procedural or Custom Map URL). Overrides Custom Map URL when set.",
-      "env_variable": "WIPE_MAP_URL",
-      "default_value": "",
-      "user_viewable": true,
-      "user_editable": true,
-      "rules": "nullable|string",
       "field_type": "text"
     },
     {
@@ -377,16 +367,6 @@
       "user_viewable": true,
       "user_editable": true,
       "rules": "required|boolean",
-      "field_type": "text"
-    },
-    {
-      "name": "Steam Branch",
-      "description": "Optional Steam branch (e.g., staging, aux1). Auto-set by staging\/aux frameworks.",
-      "env_variable": "STEAM_BRANCH",
-      "default_value": "",
-      "user_viewable": true,
-      "user_editable": true,
-      "rules": "nullable|string",
       "field_type": "text"
     },
     {

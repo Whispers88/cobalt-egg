@@ -33,51 +33,6 @@ run_ep() { # extra KEY=VAL pairs as args
   RC=$?
 }
 
-echo "Scenario A: map wipe"
-new_home
-mkdir -p "$H/server/rust"
-touch "$H/server/rust/proc.map" "$H/server/rust/proc.sav" "$H/server/rust/proc.sav.1" "$H/server/rust/player.blueprints.5.db"
-printf 'map' > "$H/.cobalt/pending_wipe"
-run_ep
-check "exit 0"                        '[[ $RC -eq 0 ]]'
-check "*.map deleted"                 '[[ ! -e "$H/server/rust/proc.map" ]]'
-check "*.sav deleted"                 '[[ ! -e "$H/server/rust/proc.sav" ]]'
-check "*.sav.N backups deleted"       '[[ ! -e "$H/server/rust/proc.sav.1" ]]'
-check "blueprints KEPT on map wipe"   '[[ -e "$H/server/rust/player.blueprints.5.db" ]]'
-check "flag consumed"                 '[[ ! -e "$H/.cobalt/pending_wipe" ]]'
-
-echo "Scenario B: full wipe"
-new_home
-mkdir -p "$H/server/rust"
-touch "$H/server/rust/proc.map" "$H/server/rust/player.blueprints.5.db" "$H/server/rust/player.deaths.5.db" "$H/server/rust/player.tokens.db"
-printf 'full' > "$H/.cobalt/pending_wipe"
-run_ep
-check "blueprints deleted"            '[[ ! -e "$H/server/rust/player.blueprints.5.db" ]]'
-check "deaths deleted"                '[[ ! -e "$H/server/rust/player.deaths.5.db" ]]'
-check "map deleted"                   '[[ ! -e "$H/server/rust/proc.map" ]]'
-
-echo "Scenario C: seed rotation (random)"
-new_home
-mkdir -p "$H/server/rust"
-printf 'map' > "$H/.cobalt/pending_wipe"
-run_ep WIPE_NEW_SEED=random
-SEED="$(cat "$H/.cobalt/seed" 2>/dev/null || echo MISSING)"
-check "seed file written"             '[[ "$SEED" != "MISSING" && -n "$SEED" ]]'
-check "seed overridden in argv"       'echo "$OUT" | grep -q "\"+server.seed\",\"$SEED\""'
-check "old seed 1234 gone from argv"  '! echo "$OUT" | grep -q "\"+server.seed\",\"1234\""'
-
-echo "Scenario D: seed rotation (csv list)"
-new_home
-mkdir -p "$H/server/rust"
-printf 'map' > "$H/.cobalt/pending_wipe"
-run_ep WIPE_NEW_SEED="111,222,333"
-S1="$(cat "$H/.cobalt/seed")"
-printf 'map' > "$H/.cobalt/pending_wipe"
-run_ep WIPE_NEW_SEED="111,222,333"
-S2="$(cat "$H/.cobalt/seed")"
-check "csv rotation starts at first"  '[[ "$S1" == "111" && "$S2" == "222" ]]'
-check "seed substituted into argv"    'echo "$OUT" | grep -q "\"+server.seed\",\"222\""'
-
 echo "Scenario E: pin match skips steamcmd"
 new_home
 write_acf 4242
@@ -93,13 +48,6 @@ printf '4242' > "$H/.cobalt/pin"
 run_ep AUTO_UPDATE=1
 check "exit 0"                        '[[ $RC -eq 0 ]]'
 check "as-installed warning"          'echo "$OUT" | grep -q "AS-INSTALLED"'
-
-echo "Scenario G: PIN_BUILD env seeds pin file"
-new_home
-write_acf 6161
-run_ep AUTO_UPDATE=1 PIN_BUILD=6161
-check "pin file seeded"               '[[ "$(cat "$H/.cobalt/pin" 2>/dev/null)" == "6161" ]]'
-check "pinned message"                'echo "$OUT" | grep -q "PINNED to build 6161"'
 
 echo "Scenario H: rollback apply"
 new_home
@@ -153,7 +101,7 @@ rm -f "$H/RustDedicated"
 run_ep
 check "missing RustDedicated -> exit 13" '[[ $RC -eq 13 ]]'
 
-echo "Scenario K: carbon-staging framework install (fake curl; staging has only Debug)"
+echo "Scenario K: carbon + staging branch install (fake curl; staging has only Debug)"
 new_home
 # fake curl: 404 everything except Carbon.Linux.Debug.tar.gz, log requested URLs
 FAKEBIN="$(mktemp -d)"
@@ -177,20 +125,20 @@ exit 22
 FAKE
 chmod +x "$FAKEBIN/curl"
 OUT="$(env COBALT_HOME="$H" COBALT_WRAPPER="$STUB" PATH="$FAKEBIN:$PATH" CURLLOG="$CURLLOG" \
-    AUTO_UPDATE=0 FRAMEWORK_UPDATE=1 VALIDATE=0 FRAMEWORK=carbon-staging \
+    AUTO_UPDATE=0 FRAMEWORK_UPDATE=1 VALIDATE=0 FRAMEWORK=carbon STEAM_BRANCH=staging \
     PREFLIGHT_PORTCHECK=0 OOM_WATCH=0 DISK_MIN_FREE_MB=0 \
     SERVER_IDENTITY=rust MAP_URL="" STARTUP="$STARTUP_BASE" \
     bash "$EP" 2>&1)"; RC=$?
 check "exit 0"                          '[[ $RC -eq 0 ]]'
 check "used CarbonCommunity/Carbon repo" 'grep -q "CarbonCommunity/Carbon" "$CURLLOG"'
-check "used rustbeta_staging_build tag"  'grep -q "rustbeta_staging_build" "$CURLLOG"'
+check "branch staging -> staging tag"    'grep -q "rustbeta_staging_build" "$CURLLOG"'
 check "tried Release first"              'head -1 "$CURLLOG" | grep -q "Carbon.Linux.Release.tar.gz"'
 check "fell back to Debug"               'grep -q "Carbon.Linux.Debug.tar.gz" "$CURLLOG"'
 check "carbon/ extracted"                '[[ -f "$H/carbon/marker" ]]'
 check "artifact archived"                'ls "$H/.cobalt/frameworks/"carbon-rustbeta_staging_build-*.tar.gz >/dev/null 2>&1'
-check "last_install framework recorded"  'grep -q "carbon-staging" "$H/.cobalt/last_install"'
+check "last_install framework recorded"  'grep -q "\"framework\":\"carbon\"" "$H/.cobalt/last_install"'
 
-echo "Scenario L: carbon-staging download fails but existing install is kept"
+echo "Scenario L: carbon download fails but existing install is kept"
 new_home
 mkdir -p "$H/carbon"; echo existing > "$H/carbon/marker"   # pretend Carbon already installed
 FAKEBIN2="$(mktemp -d)"
@@ -200,7 +148,7 @@ exit 22
 FAKE
 chmod +x "$FAKEBIN2/curl"
 OUT="$(env COBALT_HOME="$H" COBALT_WRAPPER="$STUB" PATH="$FAKEBIN2:$PATH" \
-    AUTO_UPDATE=0 FRAMEWORK_UPDATE=1 VALIDATE=0 FRAMEWORK=carbon-staging \
+    AUTO_UPDATE=0 FRAMEWORK_UPDATE=1 VALIDATE=0 FRAMEWORK=carbon STEAM_BRANCH=staging \
     PREFLIGHT_PORTCHECK=0 OOM_WATCH=0 DISK_MIN_FREE_MB=0 \
     SERVER_IDENTITY=rust MAP_URL="" STARTUP="$STARTUP_BASE" \
     bash "$EP" 2>&1)"; RC=$?
@@ -208,29 +156,18 @@ check "boots anyway (exit 0)"            '[[ $RC -eq 0 ]]'
 check "kept existing install msg"        'echo "$OUT" | grep -q "keeping existing install"'
 check "existing carbon untouched"        '[[ "$(cat "$H/carbon/marker")" == "existing" ]]'
 
-echo "Scenario M: wipe custom map URL (single + csv rotation)"
+echo "Scenario M: branch decoupled from framework (vanilla on staging)"
 new_home
-mkdir -p "$H/server/rust"
-printf 'map' > "$H/.cobalt/pending_wipe"
-run_ep WIPE_MAP_URL="http://ex/m1.map"
-check "single map url written"        '[[ "$(cat "$H/.cobalt/mapurl")" == "http://ex/m1.map" ]]'
-check "levelurl in argv"              'echo "$OUT" | grep -q "\"+server.levelurl\",\"http://ex/m1.map\""'
-check "no worldsize with map url"     '! echo "$OUT" | grep -q "+server.worldsize"'
-# next boot (no wipe) still uses the wiped map
-run_ep
-check "map url persists next boot"    'echo "$OUT" | grep -q "\"+server.levelurl\",\"http://ex/m1.map\""'
-# csv rotation across two wipes
-new_home
-mkdir -p "$H/server/rust"
-printf 'map' > "$H/.cobalt/pending_wipe"; run_ep WIPE_MAP_URL="http://ex/a.map,http://ex/b.map"
-M1="$(cat "$H/.cobalt/mapurl")"
-printf 'map' > "$H/.cobalt/pending_wipe"; run_ep WIPE_MAP_URL="http://ex/a.map,http://ex/b.map"
-M2="$(cat "$H/.cobalt/mapurl")"
-check "map url rotates a->b"          '[[ "$M1" == "http://ex/a.map" && "$M2" == "http://ex/b.map" ]]'
-# empty WIPE_MAP_URL clears the override (revert to procedural)
-printf 'map' > "$H/.cobalt/pending_wipe"; run_ep WIPE_MAP_URL=""
-check "empty clears map override"     '[[ ! -f "$H/.cobalt/mapurl" ]]'
-check "reverts to procedural"         'echo "$OUT" | grep -q "+server.worldsize"'
+FAKEBIN3="$(mktemp -d)"; SCLOG="$H/.cobalt/steam.log"
+cat > "$FAKEBIN3/steamcmd" <<FAKE
+#!/bin/bash
+echo "\$@" >> "$SCLOG"
+FAKE
+chmod +x "$FAKEBIN3/steamcmd"
+mkdir -p "$H/steamcmd"; ln -sf "$FAKEBIN3/steamcmd" "$H/steamcmd/steamcmd.sh"
+run_ep AUTO_UPDATE=1 FRAMEWORK_UPDATE=1 FRAMEWORK=vanilla STEAM_BRANCH=staging
+check "branch passed to steamcmd -beta"  'grep -q -- "-beta staging" "$SCLOG"'
+check "vanilla installs no framework"    'echo "$OUT" | grep -q "Vanilla channel"'
 
 echo "Scenario N: Carbon doorstop armed only when carbon installed"
 new_home
@@ -242,14 +179,14 @@ export DOORSTOP_TARGET_ASSEMBLY="$H/carbon/managed/Carbon.Preloader.dll"
 export LD_PRELOAD="$H/libdoorstop.so"
 export LD_LIBRARY_PATH="$H:$H/RustDedicated_Data/Plugins/x86_64"
 EOF
-run_ep FRAMEWORK=carbon-staging
+run_ep FRAMEWORK=carbon
 check "doorstop armed for carbon"       'echo "$OUT" | grep -q "STUB_DOORSTOP.*Carbon.Preloader.dll"'
 check "arming logged"                   'echo "$OUT" | grep -q "doorstop environment armed"'
 # real DOORSTOP/LD_PRELOAD must NOT leak into the exec env (node stays clean)
 check "no raw LD_PRELOAD in exec env"   '! echo "$OUT" | grep -q "STUB_DOORSTOP none.*LD_PRELOAD"'
 # carbon selected but not installed -> warn, do not arm
 new_home
-run_ep FRAMEWORK=carbon-staging
+run_ep FRAMEWORK=carbon
 check "warns when carbon missing"       'echo "$OUT" | grep -q "will NOT load"'
 check "doorstop not armed if missing"   'echo "$OUT" | grep -q "STUB_DOORSTOP none"'
 # vanilla never arms
