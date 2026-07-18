@@ -59,8 +59,39 @@ const CATALOG_MAX = 20;
 const COLOR = !("NO_COLOR" in process.env);
 const C = COLOR
   ? { reset: "\x1b[0m", dim: "\x1b[2m", red: "\x1b[31m", green: "\x1b[32m",
-      yellow: "\x1b[33m", cyan: "\x1b[36m", magenta: "\x1b[35m", white: "\x1b[37m" }
-  : { reset: "", dim: "", red: "", green: "", yellow: "", cyan: "", magenta: "", white: "" };
+      yellow: "\x1b[33m", cyan: "\x1b[36m", magenta: "\x1b[35m", white: "\x1b[37m", rcon: "\x1b[36m" }
+  : { reset: "", dim: "", red: "", green: "", yellow: "", cyan: "", magenta: "", white: "", rcon: "" };
+
+// Optional custom palette. CONSOLE_COLORS = comma-separated hex in slot order
+// normal,error,warn,oxide,carbon,rcon — OR name=hex pairs (e.g. oxide=cc66ff).
+// Blank slots keep their default. Emitted as 24-bit truecolor ANSI, which the
+// panel's xterm.js renders.
+if (COLOR && (process.env.CONSOLE_COLORS || "").trim()) {
+  const POS = ["green", "red", "yellow", "magenta", "cyan", "rcon"];
+  const NAME = { normal: "green", error: "red", warn: "yellow", warning: "yellow",
+                 oxide: "magenta", carbon: "cyan", rcon: "rcon" };
+  const hexToAnsi = (h) => {
+    const m = /^#?([0-9a-fA-F]{6})$/.exec((h || "").trim());
+    if (!m) return null;
+    const n = parseInt(m[1], 16);
+    return `\x1b[38;2;${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}m`;
+  };
+  const toks = process.env.CONSOLE_COLORS.split(",");
+  const named = toks.some((t) => t.includes("="));
+  toks.forEach((tok, i) => {
+    tok = tok.trim();
+    if (!tok) return;
+    let key, hex;
+    if (named) {
+      const eq = tok.indexOf("=");
+      if (eq < 0) return;
+      key = NAME[tok.slice(0, eq).trim().toLowerCase()];
+      hex = tok.slice(eq + 1);
+    } else { key = POS[i]; hex = tok; }
+    const ansi = key ? hexToAnsi(hex) : null;
+    if (ansi) C[key] = ansi;
+  });
+}
 
 // ---------- output ----------
 const hhmm = () => {
@@ -299,7 +330,7 @@ function rconConnect() {
     const body = String(obj.Message ?? "").replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
     for (const ln of body.split(/\r?\n/)) {
       if (!ln.trim()) continue;
-      process.stdout.write(`${C.dim}${hhmm()}${C.reset} ${C.cyan}[rcon] ${ln}${C.reset}\n`);
+      process.stdout.write(`${C.dim}${hhmm()}${C.reset} ${C.rcon}[rcon] ${ln}${C.reset}\n`);
     }
   });
   sock.addEventListener("error", () => done("error"));

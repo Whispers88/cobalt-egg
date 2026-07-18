@@ -73,6 +73,7 @@ keep `FRAMEWORK=carbon` so doorstop is still armed).
 | `UPDATE_CHECK_INTERVAL_SEC` | `3600` | update-available warning; 0 = off |
 | `SERVER_IDENTITY` | `rust` | saves live in `server/<identity>/` |
 | `DISK_MIN_FREE_MB` / `DISK_ENFORCE` / `PREFLIGHT_PORTCHECK` / `OOM_WATCH` | | boot preflight guards |
+| `CONSOLE_COLORS` | *(empty)* | custom console palette — comma hex `normal,error,warn,oxide,carbon,rcon` (blank slots keep defaults) or `name=hex` pairs; truecolor |
 
 A `.pteroignore` is written on first boot so panel backups skip `steamcmd/`,
 `Steam/`, logs, and rollback staging (saves GB per backup).

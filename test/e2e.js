@@ -251,6 +251,26 @@ async function test7_carbonDoorstop() {
   await r.waitExit();
 }
 
+async function test8_customColours() {
+  console.log("test 8: CONSOLE_COLORS custom hex palette");
+  // positional: slot 4 = oxide = ff00ff -> truecolor
+  let home = mkHome(); writeAcf(home, 11111);
+  let r = new Run(home, { color: true, envExtra: { CONSOLE_COLORS: "00cc66,ff0000,ffcc00,ff00ff,00ffff,00ffff" } });
+  await r.waitFor(/Loading extension Oxide/);
+  await sleep(150);
+  assert(r.out.includes("\x1b[38;2;255;0;255m"), "expected truecolor oxide from positional hex ff00ff");
+  ok("positional hex applied (oxide=ff00ff -> 38;2;255;0;255)");
+  r.send("quit"); await r.waitExit();
+  // named: oxide=00ff00 -> truecolor green
+  home = mkHome(); writeAcf(home, 11111);
+  r = new Run(home, { color: true, envExtra: { CONSOLE_COLORS: "oxide=00ff00" } });
+  await r.waitFor(/Loading extension Oxide/);
+  await sleep(150);
+  assert(r.out.includes("\x1b[38;2;0;255;0m"), "expected truecolor oxide from named hex 00ff00");
+  ok("named hex applied (oxide=00ff00 -> 38;2;0;255;0)");
+  r.send("quit"); await r.waitExit();
+}
+
 (async () => {
   await test1_happyPath();
   await test2_stdinFallback();
@@ -259,5 +279,6 @@ async function test7_carbonDoorstop() {
   await test5_colours();
   await test6_reconnectAfterDelay();
   await test7_carbonDoorstop();
+  await test8_customColours();
   console.log(`\nE2E: all ${passed} checks passed`);
 })().catch((e) => { console.error("\nE2E FAILED:", e.message); process.exit(1); });

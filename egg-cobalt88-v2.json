@@ -398,6 +398,16 @@
       "user_editable": true,
       "rules": "nullable|string",
       "field_type": "text"
+    },
+    {
+      "name": "Console Colours",
+      "description": "Custom console colours as comma-separated hex, in order normal,error,warn,oxide,carbon,rcon (e.g. 00cc66,ff5555,ffcc00,cc66ff,66ccff,66ccff). Leave a slot blank to keep its default. Or use name=hex pairs (e.g. oxide=cc66ff,error=ff5555). Empty = built-in scheme.",
+      "env_variable": "CONSOLE_COLORS",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string",
+      "field_type": "text"
     }
   ]
 }
