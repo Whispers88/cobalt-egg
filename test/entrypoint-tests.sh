@@ -205,6 +205,7 @@ touch "$H/steamcmd/cache-marker"
 run_ep STEAM_BRANCH=""                              # switch staging -> public
 check "branch change clears steamcmd"   '[[ ! -e "$H/steamcmd/cache-marker" ]]'
 check "branch change forces validate"   '[[ -e "$H/.cobalt/force_validate" ]]'
+check "force_validate reason is branch" 'grep -q "branch change staging -> public" "$H/.cobalt/force_validate"'
 check "branch updated to public"        '[[ "$(cat "$H/.cobalt/branch")" == "public" ]]'
 check "change logged"                   'echo "$OUT" | grep -q "branch changed"'
 # same branch again -> no clean
@@ -212,6 +213,14 @@ touch "$H/steamcmd/keep-marker"; rm -f "$H/.cobalt/force_validate"
 run_ep STEAM_BRANCH=""
 check "same branch keeps steamcmd"      '[[ -e "$H/steamcmd/keep-marker" ]]'
 check "same branch no validate"         '[[ ! -e "$H/.cobalt/force_validate" ]]'
+# update run after a branch change: message is branch-aware and validate is consumed
+FAKEBIN4="$(mktemp -d)"; SCLOG2="$H/.cobalt/steam2.log"
+printf '#!/bin/bash\necho "$@" >> "%s"\n' "$SCLOG2" > "$FAKEBIN4/steamcmd"
+chmod +x "$FAKEBIN4/steamcmd"
+run_ep PATH="$FAKEBIN4:$PATH" AUTO_UPDATE=1 STEAM_BRANCH=staging
+check "branch-aware validate message"   'echo "$OUT" | grep -q "Forcing full validation (branch change public -> staging)"'
+check "validate passed to steamcmd"     'grep -qw "validate" "$SCLOG2"'
+check "force_validate consumed"         '[[ ! -e "$H/.cobalt/force_validate" ]]'
 
 echo ""
 echo "Entrypoint tests: $PASS passed, $FAIL failed"

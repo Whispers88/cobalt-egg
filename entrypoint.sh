@@ -247,7 +247,7 @@ if [[ -f "$PENDING_RB" ]]; then
       esac
     fi
     # acf still claims the newer build — force a validate on the next unpinned update
-    touch "$COBALT_DIR/force_validate"
+    printf 'post-rollback to build %s' "$RB_BUILD" > "$COBALT_DIR/force_validate"
     good "Rollback to build ${RB_BUILD} applied (server is pinned to it)."
   fi
   rm -f "$PENDING_RB"
@@ -272,7 +272,10 @@ do_update() {
   local VFLAG=""
   if [[ "$VALIDATE" == "1" || -f "$COBALT_DIR/force_validate" ]]; then
     VFLAG="validate"
-    [[ -f "$COBALT_DIR/force_validate" ]] && warn "force_validate set (post-rollback) — running full validation."
+    if [[ -f "$COBALT_DIR/force_validate" ]]; then
+      local reason; reason="$(cat "$COBALT_DIR/force_validate" 2>/dev/null)"
+      warn "Forcing full validation (${reason:-forced})."
+    fi
   fi
   log "SteamCMD app_update ${SRCDS_APPID} (branch: ${STEAM_BRANCH:-public}${VFLAG:+, validate})…"
   "$SCMD" +force_install_dir "$CH" +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
@@ -293,7 +296,7 @@ if [[ "$LAST_BRANCH" != "__none__" && "$LAST_BRANCH" != "$CUR_BRANCH" ]]; then
   warn "Rust branch changed '${LAST_BRANCH}' -> '${CUR_BRANCH}': clearing steamcmd cache and forcing a validate."
   rm -rf "$CH/steamcmd"
   mkdir -p "$CH/steamcmd"
-  touch "$COBALT_DIR/force_validate"
+  printf 'branch change %s -> %s' "$LAST_BRANCH" "$CUR_BRANCH" > "$COBALT_DIR/force_validate"
 fi
 printf '%s' "$CUR_BRANCH" > "$BRANCH_FILE"
 
