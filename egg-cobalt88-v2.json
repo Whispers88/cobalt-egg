@@ -271,12 +271,22 @@
     },
     {
       "name": "Validate Game Files",
-      "description": "Full SteamCMD file validation each start (slow — minutes). Normally 0; runs automatically once after a rollback.",
+      "description": "Full file validation (checksum) each start (slow — minutes). Normally 0; runs automatically once after a rollback or branch change.",
       "env_variable": "VALIDATE",
       "default_value": "0",
       "user_viewable": true,
       "user_editable": true,
       "rules": "required|boolean",
+      "field_type": "text"
+    },
+    {
+      "name": "Downloader",
+      "description": "Tool used to download\/validate game files: steamcmd (default) or depotdownloader (SteamRE DepotDownloader — downloads straight into the server dir).",
+      "env_variable": "DOWNLOADER",
+      "default_value": "steamcmd",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:steamcmd,depotdownloader",
       "field_type": "text"
     },
     {

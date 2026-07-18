@@ -222,6 +222,26 @@ check "branch-aware validate message"   'echo "$OUT" | grep -q "Forcing full val
 check "validate passed to steamcmd"     'grep -qw "validate" "$SCLOG2"'
 check "force_validate consumed"         '[[ ! -e "$H/.cobalt/force_validate" ]]'
 
+echo "Scenario P: DepotDownloader backend"
+new_home
+FAKEDD="$(mktemp -d)"; DDLOG="$H/.cobalt/dd.log"
+printf '#!/bin/bash\necho "$@" >> "%s"\n' "$DDLOG" > "$FAKEDD/DepotDownloader"
+chmod +x "$FAKEDD/DepotDownloader"
+run_ep AUTO_UPDATE=1 DOWNLOADER=depotdownloader STEAM_BRANCH=staging VALIDATE=1 \
+       COBALT_DEPOTDOWNLOADER="$FAKEDD/DepotDownloader"
+check "DepotDownloader invoked"          '[[ -f "$DDLOG" ]]'
+check "app id passed"                    'grep -q -- "-app 258550" "$DDLOG"'
+check "branch passed"                    'grep -q -- "-branch staging" "$DDLOG"'
+check "install dir passed"               'grep -q -- "-dir $H" "$DDLOG"'
+check "validate passed"                  'grep -q -- "-validate" "$DDLOG"'
+check "anonymous (no -username)"         '! grep -q -- "-username" "$DDLOG"'
+check "did not call steamcmd path"       'echo "$OUT" | grep -q "DepotDownloader app 258550"'
+# missing binary -> clear error
+new_home
+run_ep AUTO_UPDATE=1 DOWNLOADER=depotdownloader COBALT_DEPOTDOWNLOADER=/nonexistent/DepotDownloader
+check "missing DepotDownloader -> exit 11" '[[ $RC -eq 11 ]]'
+check "missing DepotDownloader message"    'echo "$OUT" | grep -q "DepotDownloader not found"'
+
 echo ""
 echo "Entrypoint tests: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

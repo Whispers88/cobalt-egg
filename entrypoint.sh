@@ -45,6 +45,7 @@ if [[ ! -f "$CH/.pteroignore" ]]; then
   cat > "$CH/.pteroignore" <<'EOF'
 steamcmd/
 Steam/
+.DepotDownloader/
 .cobalt/staging/
 unity.log*
 cobalt.log*
@@ -58,6 +59,13 @@ export STEAMCMDDIR="$CH/steamcmd"
 steamcmd_path() {
   if [[ -x "$CH/steamcmd/steamcmd.sh" ]]; then echo "$CH/steamcmd/steamcmd.sh"; return; fi
   if command -v steamcmd >/dev/null 2>&1; then command -v steamcmd; return; fi
+  echo ""
+}
+depotdownloader_path() {
+  if [[ -n "${COBALT_DEPOTDOWNLOADER:-}" && -x "${COBALT_DEPOTDOWNLOADER}" ]]; then echo "$COBALT_DEPOTDOWNLOADER"; return; fi
+  for p in /opt/depotdownloader/DepotDownloader "$CH/depotdownloader/DepotDownloader"; do
+    [[ -x "$p" ]] && { echo "$p"; return; }
+  done
   echo ""
 }
 
@@ -74,6 +82,7 @@ STEAM_AUTH="${STEAM_AUTH:-}"
 FRAMEWORK="${FRAMEWORK:-vanilla}"
 FRAMEWORK_UPDATE="${FRAMEWORK_UPDATE:-1}"
 AUTO_UPDATE="${AUTO_UPDATE:-1}"
+DOWNLOADER="${DOWNLOADER:-steamcmd}"   # steamcmd | depotdownloader
 VALIDATE="${VALIDATE:-0}"          # full 8GB checksum every boot costs minutes; app_update alone no-ops when current
 EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 STEAM_BRANCH="${STEAM_BRANCH:-}"   # "" (public) | staging | aux01 | aux02 | ...
@@ -81,7 +90,7 @@ STEAM_BRANCH_PASS="${STEAM_BRANCH_PASS:-}"
 CUSTOM_FRAMEWORK_URL="${CUSTOM_FRAMEWORK_URL:-${CustomFrameworkURL:-}}"
 
 SERVER_IDENTITY="${SERVER_IDENTITY:-rust}"
-PRESERVE_DIRS="${PRESERVE_DIRS:-oxide,carbon,cfg,Configs,plugins,Carbon,oxide.config.json,server,.cobalt,steamcmd,Steam,.steam,steamapps}"
+PRESERVE_DIRS="${PRESERVE_DIRS:-oxide,carbon,cfg,Configs,plugins,Carbon,oxide.config.json,server,.cobalt,steamcmd,Steam,.steam,steamapps,.DepotDownloader}"
 
 # RCON + wrapper knobs (wrapper reads env)
 export RCON_HOST="${RCON_HOST:-127.0.0.1}"
@@ -264,19 +273,38 @@ acf_buildid() {
 }
 
 do_update() {
+  # decide whether to validate (VALIDATE=1 or a queued force_validate)
+  local do_validate=0
+  if [[ "$VALIDATE" == "1" || -f "$COBALT_DIR/force_validate" ]]; then
+    do_validate=1
+    if [[ -f "$COBALT_DIR/force_validate" ]]; then
+      local reason; reason="$(cat "$COBALT_DIR/force_validate" 2>/dev/null)"
+      warn "Forcing full validation (${reason:-forced})."
+    fi
+  fi
+
+  if [[ "$DOWNLOADER" == "depotdownloader" ]]; then
+    local DD; DD="$(depotdownloader_path)"
+    [[ -z "$DD" ]] && { bad "DepotDownloader not found (/opt/depotdownloader/DepotDownloader)"; exit 11; }
+    # anonymous by default (no -username); downloads straight into -dir, no relocate
+    local DD_ARGS=(-app "$SRCDS_APPID" -dir "$CH")
+    [[ -n "$STEAM_BRANCH" ]] && DD_ARGS+=(-branch "$STEAM_BRANCH")
+    [[ -n "$STEAM_BRANCH_PASS" ]] && DD_ARGS+=(-branchpassword "$STEAM_BRANCH_PASS")
+    [[ "$do_validate" == "1" ]] && DD_ARGS+=(-validate)
+    log "DepotDownloader app ${SRCDS_APPID} (branch: ${STEAM_BRANCH:-public}$([[ "$do_validate" == 1 ]] && printf ', validate'))…"
+    "$DD" "${DD_ARGS[@]}"
+    rm -f "$COBALT_DIR/force_validate"
+    good "Game files up to date (DepotDownloader)."
+    return
+  fi
+
   local SCMD; SCMD="$(steamcmd_path)"
   [[ -z "$SCMD" ]] && { bad "steamcmd not found"; exit 11; }
   local BRANCH_FLAGS=""
   [[ -n "$STEAM_BRANCH" ]] && BRANCH_FLAGS="-beta ${STEAM_BRANCH}"
   [[ -n "$STEAM_BRANCH_PASS" ]] && BRANCH_FLAGS="${BRANCH_FLAGS} -betapassword ${STEAM_BRANCH_PASS}"
   local VFLAG=""
-  if [[ "$VALIDATE" == "1" || -f "$COBALT_DIR/force_validate" ]]; then
-    VFLAG="validate"
-    if [[ -f "$COBALT_DIR/force_validate" ]]; then
-      local reason; reason="$(cat "$COBALT_DIR/force_validate" 2>/dev/null)"
-      warn "Forcing full validation (${reason:-forced})."
-    fi
-  fi
+  [[ "$do_validate" == "1" ]] && VFLAG="validate"
   log "SteamCMD app_update ${SRCDS_APPID} (branch: ${STEAM_BRANCH:-public}${VFLAG:+, validate})…"
   "$SCMD" +force_install_dir "$CH" +login "${STEAM_USER}" "${STEAM_PASS}" "${STEAM_AUTH}" \
     +app_update "${SRCDS_APPID}" ${BRANCH_FLAGS} ${EXTRA_FLAGS} ${VFLAG} +quit

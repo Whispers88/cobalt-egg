@@ -65,8 +65,9 @@ keep `FRAMEWORK=carbon` so doorstop is still armed).
 | `FRAMEWORK` | `carbon` | `vanilla` / `oxide` / `carbon` / `carbon-minimal` |
 | `STEAM_BRANCH` | *(empty)* | Rust game branch: empty=public, `staging`, `aux01`, `aux02` |
 | `CUSTOM_FRAMEWORK_URL` | — | direct framework archive URL; overrides `FRAMEWORK` |
-| `AUTO_UPDATE` | `1` | SteamCMD app_update on boot (ignored while pinned) |
-| `VALIDATE` | `0` | full checksum costs minutes; auto-forced once after rollback |
+| `AUTO_UPDATE` | `1` | app_update on boot (ignored while pinned) |
+| `DOWNLOADER` | `steamcmd` | `steamcmd` or `depotdownloader` (SteamRE, self-contained, downloads straight into the server dir) |
+| `VALIDATE` | `0` | full checksum costs minutes; auto-forced once after rollback/branch change |
 | `GAMEMODE` | `vanilla` | `vanilla`/`softcore`/`hardcore` (`in:` rule — dropdown on Pelican or with the dropdown addon, validated text box on stock Ptero) |
 | `SHUTDOWN_TIMEOUT_SEC` | `60` | save time before force-kill; big maps need it |
 | `UPDATE_CHECK_INTERVAL_SEC` | `3600` | update-available warning; 0 = off |
