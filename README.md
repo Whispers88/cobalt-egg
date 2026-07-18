@@ -19,7 +19,6 @@ zero-dependency wrapper (Node 22 native WebSocket).
 | `.unpin` | resume updates at next restart |
 | `.rollback <buildid\|last>` | download old build now, **applied at next restart** |
 | `.telemetry` | game CPU/RSS, loadavg, disk |
-| `.stdin <x>` | write to game stdin (needs `ALLOW_STDIN=1`) |
 
 Rollback is **staged as a flag and applied at boot** — the only safe mutation
 point in the container lifecycle; `.rollback` then restart.

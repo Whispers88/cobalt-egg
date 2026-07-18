@@ -320,16 +320,6 @@
       "field_type": "text"
     },
     {
-      "name": "Allow Stdin Escape Hatch",
-      "description": "Enable the .stdin command (writes directly to game stdin). Rarely needed.",
-      "env_variable": "ALLOW_STDIN",
-      "default_value": "0",
-      "user_viewable": true,
-      "user_editable": true,
-      "rules": "required|boolean",
-      "field_type": "text"
-    },
-    {
       "name": "Preserve Dirs",
       "description": "Comma-separated top-level names a rollback apply must never touch.",
       "env_variable": "PRESERVE_DIRS",

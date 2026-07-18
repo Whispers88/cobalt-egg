@@ -126,10 +126,6 @@ async function test1_happyPath() {
   await r.waitFor(/no catalog entry for '424242'/);
   ok(".rollback rejects unknown build");
 
-  r.send(".stdin say hi");
-  await r.waitFor(/\[stdin\] disabled/);
-  ok(".stdin gated behind ALLOW_STDIN");
-
   r.send("!echo hello-from-shell");
   await r.waitFor(/hello-from-shell/);
   ok("! shell passthrough");

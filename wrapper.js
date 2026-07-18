@@ -21,7 +21,6 @@
 //   .unpin                  resume updates on next boot
 //   .rollback <build|last>  stage rollback (download now, applied at next boot)
 //   .telemetry              game CPU/RSS + loadavg + disk
-//   .stdin <x>              write to game stdin (ALLOW_STDIN=1 only)
 //   rcon: <x>               explicit rcon send
 //   <anything else>         rcon send
 // ============================================================================
@@ -46,7 +45,6 @@ const RCON_PASS = process.env.RCON_PASS || "";
 const SHUTDOWN_TIMEOUT_SEC = parseInt(process.env.SHUTDOWN_TIMEOUT_SEC || "60", 10);
 const TELEMETRY_INTERVAL_SEC = parseInt(process.env.TELEMETRY_INTERVAL_SEC || "0", 10);
 const UPDATE_CHECK_INTERVAL_SEC = parseInt(process.env.UPDATE_CHECK_INTERVAL_SEC || "3600", 10);
-const ALLOW_STDIN = process.env.ALLOW_STDIN === "1";
 
 const CATALOG = path.join(COBALT_DIR, "versions.json");
 const PIN_FILE = path.join(COBALT_DIR, "pin");
@@ -417,7 +415,7 @@ if (UPDATE_CHECK_INTERVAL_SEC > 0) {
 // ---------- panel commands ----------
 function cmdHelp() {
   wline("[cobalt] commands: !<sh> · .version · .pin [build] · .unpin · .rollback <build|last> · " +
-    ".telemetry · rcon:<x> · quit" + (ALLOW_STDIN ? " · .stdin <x>" : ""));
+    ".telemetry · rcon:<x> · quit");
 }
 
 function cmdVersion() {
@@ -565,13 +563,6 @@ process.stdin.on("data", (txt) => {
       const arg = line.slice(9).trim();
       if (!arg) { werr("[rollback] usage: .rollback <buildid|last>"); continue; }
       cmdRollback(arg); continue;
-    }
-    if (lower.startsWith(".stdin ")) {
-      if (!ALLOW_STDIN) { werr("[stdin] disabled — set ALLOW_STDIN=1"); continue; }
-      const payload = line.slice(7);
-      try { game.stdin.write(payload + "\n"); wline(`[stdin] ${payload}`); }
-      catch { werr("[stdin] write failed"); }
-      continue;
     }
     if (lower.startsWith("rcon:")) { rconSend(line.slice(5).trim()); continue; }
     if (line.startsWith(".")) { werr(`[cobalt] unknown command '${line}' — .help`); continue; }
