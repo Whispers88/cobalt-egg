@@ -281,6 +281,22 @@ do_update() {
   good "Steam files up to date."
 }
 
+# ---------- branch-change clean ----------
+# When the Rust Steam branch changes, wipe the steamcmd cache and force a
+# validate. (The steamcmd folder holds the depot download cache; the game's
+# appmanifest lives in steamapps/, so app_update -beta + validate is what
+# actually re-resolves the file set for the new branch — the delete alone won't.)
+BRANCH_FILE="$COBALT_DIR/branch"
+CUR_BRANCH="${STEAM_BRANCH:-public}"
+LAST_BRANCH="$(cat "$BRANCH_FILE" 2>/dev/null || echo "__none__")"
+if [[ "$LAST_BRANCH" != "__none__" && "$LAST_BRANCH" != "$CUR_BRANCH" ]]; then
+  warn "Rust branch changed '${LAST_BRANCH}' -> '${CUR_BRANCH}': clearing steamcmd cache and forcing a validate."
+  rm -rf "$CH/steamcmd"
+  mkdir -p "$CH/steamcmd"
+  touch "$COBALT_DIR/force_validate"
+fi
+printf '%s' "$CUR_BRANCH" > "$BRANCH_FILE"
+
 SKIP_FRAMEWORK=0
 if [[ -f "$PIN_FILE" ]]; then
   PINNED="$(cat "$PIN_FILE")"

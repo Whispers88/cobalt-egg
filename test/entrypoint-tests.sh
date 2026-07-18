@@ -194,6 +194,25 @@ new_home
 run_ep FRAMEWORK=vanilla
 check "vanilla does not arm doorstop"   'echo "$OUT" | grep -q "STUB_DOORSTOP none"'
 
+echo "Scenario O: changing Rust branch clears steamcmd + forces validate"
+new_home
+mkdir -p "$H/steamcmd"; touch "$H/steamcmd/cache-marker"
+run_ep STEAM_BRANCH=staging                        # first boot just records the branch
+check "branch recorded"                 '[[ "$(cat "$H/.cobalt/branch")" == "staging" ]]'
+check "first boot does NOT clean"       '[[ -e "$H/steamcmd/cache-marker" ]]'
+check "no validate forced yet"          '[[ ! -e "$H/.cobalt/force_validate" ]]'
+touch "$H/steamcmd/cache-marker"
+run_ep STEAM_BRANCH=""                              # switch staging -> public
+check "branch change clears steamcmd"   '[[ ! -e "$H/steamcmd/cache-marker" ]]'
+check "branch change forces validate"   '[[ -e "$H/.cobalt/force_validate" ]]'
+check "branch updated to public"        '[[ "$(cat "$H/.cobalt/branch")" == "public" ]]'
+check "change logged"                   'echo "$OUT" | grep -q "branch changed"'
+# same branch again -> no clean
+touch "$H/steamcmd/keep-marker"; rm -f "$H/.cobalt/force_validate"
+run_ep STEAM_BRANCH=""
+check "same branch keeps steamcmd"      '[[ -e "$H/steamcmd/keep-marker" ]]'
+check "same branch no validate"         '[[ ! -e "$H/.cobalt/force_validate" ]]'
+
 echo ""
 echo "Entrypoint tests: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
