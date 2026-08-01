@@ -61,11 +61,12 @@ ENV NODE_ENV=production
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 
 # runtime deps: unzip/tar for frameworks, curl for downloads, iproute2 for the
-# port preflight. (2.0 dropped gdb+procps — .stack/.heap are gone.)
+# port preflight, libgdiplus for plugins that use System.Drawing (image maps,
+# SignArtist, ImageLibrary…). (2.0 dropped gdb+procps — .stack/.heap are gone.)
 RUN set -eux; \
   apt-get update; \
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    unzip ca-certificates curl tzdata iproute2; \
+    unzip ca-certificates curl tzdata iproute2 libgdiplus; \
   rm -rf /var/lib/apt/lists/*; \
   useradd -m -d /home/container -s /bin/bash container || true
 
